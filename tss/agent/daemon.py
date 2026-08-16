@@ -102,6 +102,13 @@ class TestbedAgent:
             },
             timeout=self.longpoll_timeout_s + 10,
         )
+        if response.status_code == 409:
+            # We lost ONE job — cancelled, timed out, or reassigned while we were
+            # partitioned. Everything else on this bench is untouched, so this is
+            # not a re-registration: drop that run and carry on.
+            lost = response.json().get("job_id")
+            self.abandon(lost, why="lease_lost")
+            return None
         if response.status_code in (404, 410):
             # 404 unknown_agent / 410 presence_expired. Both mean the same thing
             # to us: TSS no longer believes in this bench. Re-register and come
@@ -115,6 +122,28 @@ class TestbedAgent:
             return None
         response.raise_for_status()
         return response.json()
+
+    def abandon(self, job_id: str | None, *, why: str) -> None:
+        """Stop running a job and release its devices locally — without reporting.
+
+        The result of an abandoned run is worthless: TSS has already moved the
+        epoch on, so a report would be fenced out anyway. Reporting it would only
+        risk a race with whoever owns the job now.
+        """
+        if job_id is None:
+            return
+        task = self._tasks.pop(job_id, None)
+        self.running.pop(job_id, None)
+        if task is not None:
+            task.cancel()
+        log.warning("abandoning %s (%s) — releasing its devices locally", job_id, why)
+
+    def handle_directives(self, directives: list) -> None:
+        for directive in directives or []:
+            if isinstance(directive, dict) and "cancel_job" in directive:
+                self.abandon(directive["cancel_job"], why="cancel_job directive")
+            else:
+                log.info("ignoring unknown directive %r", directive)
 
     async def _run_job(self, client: httpx.AsyncClient, assignment: dict) -> None:
         """/start -> execute -> /complete. One task per job, so a bench with
@@ -141,6 +170,11 @@ class TestbedAgent:
                 # The zombie case: our lease died while we were running. Release
                 # the hardware locally and drop the result on the floor.
                 log.warning("complete %s fenced out (stale epoch); abandoning", job_id)
+        except asyncio.CancelledError:
+            # A cancel directive, or shutdown. Do NOT report: this run was
+            # abandoned, and its result is not ours to give.
+            log.info("%s cancelled mid-run; not reporting", job_id)
+            raise
         except httpx.HTTPError as exc:
             log.warning("reporting %s failed (%s)", job_id, exc.__class__.__name__)
         finally:
@@ -159,6 +193,7 @@ class TestbedAgent:
                         continue  # start polling for work now, not one beat from now
                     else:
                         body = await self.heartbeat(client)
+                        self.handle_directives((body or {}).get("directives", []))
                         assignment = (body or {}).get("assignment")
                         if assignment and assignment["job_id"] not in self.running:
                             job_id = assignment["job_id"]

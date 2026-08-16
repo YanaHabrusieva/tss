@@ -14,7 +14,8 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from tss.api.deps import get_scheduler, get_store
+from tss.api.deps import get_directives, get_scheduler, get_store
+from tss.core.directives import DirectiveQueue
 from tss.core.models import CapabilitySpec, FleetView, Job, JobState
 from tss.core.scheduler import Scheduler
 from tss.core.store import Store
@@ -23,6 +24,7 @@ router = APIRouter(prefix="/v1", tags=["client"])
 
 StoreDep = Annotated[Store, Depends(get_store)]
 SchedulerDep = Annotated[Scheduler, Depends(get_scheduler)]
+DirectivesDep = Annotated[DirectiveQueue, Depends(get_directives)]
 
 
 class SubmitRequest(BaseModel):
@@ -102,6 +104,38 @@ async def get_job(job_id: str, store: StoreDep) -> Job:
     if job is None:
         raise HTTPException(status_code=404, detail=f"unknown job {job_id}")
     return job
+
+
+@router.delete("/jobs/{job_id}")
+async def cancel_job(
+    job_id: str, store: StoreDep, scheduler: SchedulerDep, directives: DirectivesDep
+):
+    """Cancel a job (§6).
+
+    Queued dies quietly. Running is fenced first: the epoch bump inside
+    `store.cancel_job` is what stops the agent's late "PASSED" from overwriting
+    CANCELLED — I7, and the reason cancel is not simply a state change. The
+    directive is a courtesy that stops the bench wasting hardware time; it is not
+    what makes the outcome correct.
+    """
+    job = store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"unknown job {job_id}")
+    agent_id = job.agent_id
+
+    result = store.cancel_job(job_id)
+    if result == "unknown_job":
+        raise HTTPException(status_code=404, detail=f"unknown job {job_id}")
+    if result == "already_terminal":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{job_id} already finished as {job.state} — a result is never overwritten",
+        )
+
+    if result == "cancelled_running" and agent_id:
+        directives.cancel_job(agent_id, job_id)
+    scheduler.notify()  # its devices just came free
+    return {"cancelled": True, "job_id": job_id, "was_running": result == "cancelled_running"}
 
 
 @router.get("/queue", response_model=QueueView)

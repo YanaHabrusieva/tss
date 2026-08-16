@@ -18,8 +18,9 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from tss.api.deps import get_config, get_scheduler, get_store
+from tss.api.deps import get_config, get_directives, get_scheduler, get_store
 from tss.core.config import Config
+from tss.core.directives import DirectiveQueue
 from tss.core.models import Assignment, InventoryItem, Outcome, PresenceStatus
 from tss.core.scheduler import Scheduler
 from tss.core.store import Store
@@ -33,6 +34,7 @@ job_router = APIRouter(prefix="/v1/jobs", tags=["agent"])
 StoreDep = Annotated[Store, Depends(get_store)]
 ConfigDep = Annotated[Config, Depends(get_config)]
 SchedulerDep = Annotated[Scheduler, Depends(get_scheduler)]
+DirectivesDep = Annotated[DirectiveQueue, Depends(get_directives)]
 
 
 class RegisterRequest(BaseModel):
@@ -57,8 +59,8 @@ class RunningJob(BaseModel):
 
 class HeartbeatRequest(BaseModel):
     #: A bench with four devices may be running two jobs; it reports every job it
-    #: believes it owns and TSS fences each independently (§6). Fencing arrives
-    #: with completion in step 4 — for now the field is accepted and recorded.
+    #: believes it owns and TSS fences each INDEPENDENTLY (§6). Losing one job
+    #: must not disturb the others running on the same machine.
     running_jobs: list[RunningJob] = Field(default_factory=list)
     #: The agent probes its own hardware; TSS never probes a device it cannot
     #: reach (§3.1).
@@ -70,7 +72,9 @@ class HeartbeatResponse(BaseModel):
     #: immediately after taking one, so filling four devices costs four fast
     #: round-trips rather than four heartbeat intervals.
     assignment: Assignment | None = None
-    #: `drain` and `cancel_job` arrive with the operator verbs and sweep 2.
+    #: e.g. [{"cancel_job": "job-8f21"}] — best-effort hints. The epoch is what
+    #: actually fences a run TSS has given up on; this just stops the bench
+    #: wasting hardware time on it.
     directives: list[Any] = Field(default_factory=list)
 
 
@@ -112,7 +116,13 @@ async def register(req: RegisterRequest, store: StoreDep, config: ConfigDep) -> 
 
 
 @router.post("/{agent_id}/heartbeat")
-async def heartbeat(agent_id: str, req: HeartbeatRequest, store: StoreDep, scheduler: SchedulerDep):
+async def heartbeat(
+    agent_id: str,
+    req: HeartbeatRequest,
+    store: StoreDep,
+    scheduler: SchedulerDep,
+    directives: DirectivesDep,
+):
     """The workhorse: renew presence, report device health, collect work.
 
     The 404 and 410 are what make recovery reachable. A reaped agent's row still
@@ -142,11 +152,29 @@ async def heartbeat(agent_id: str, req: HeartbeatRequest, store: StoreDep, sched
     if req.resource_health:
         store.report_resource_health(agent_id, req.resource_health)
 
+    # Fence what it believes it owns, one job at a time. A bench running two jobs
+    # can lose one — cancelled, timed out, or reassigned after a network blip —
+    # and must go on running the other; that is why the 409 names a job.
+    lost = store.fence_running_jobs(agent_id, [(j.job_id, j.epoch) for j in req.running_jobs])
+    if lost is not None:
+        log.info("%s reported %s, which it no longer owns", agent_id, lost)
+        return JSONResponse(
+            status_code=409,
+            content={"error": "lease_lost", "action": "abandon_job", "job_id": lost},
+        )
+
+    pending = directives.drain(agent_id)
+    if pending:
+        return HeartbeatResponse(assignment=store.pending_assignment(agent_id), directives=pending)
+
     assignment = store.pending_assignment(agent_id)
     if assignment is None and store.has_free_resources(agent_id):
         assignment = await scheduler.wait_for_assignment(agent_id)
 
-    return HeartbeatResponse(assignment=assignment)
+    # Drained again after the long poll: a cancel may have been queued while we
+    # were blocked here, and holding it for another heartbeat interval would let
+    # the bench keep running something nobody wants.
+    return HeartbeatResponse(assignment=assignment, directives=directives.drain(agent_id))
 
 
 @job_router.post("/{job_id}/start")

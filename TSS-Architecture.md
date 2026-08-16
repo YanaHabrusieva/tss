@@ -554,6 +554,18 @@ Agent-7 gets a `409`, abandons the job, releases its hardware locally, and goes 
 capacity. This is a **fencing token** — the same mechanism distributed locks use — and it is the most
 sophisticated thing in the design. Build a `zombie` chaos profile specifically to prove it.
 
+**Directives are hints; the fence is the mechanism.** `cancel_job` is delivered through an in-process
+queue that does not survive a restart, and that is the right call. The epoch already guarantees the
+*outcome*: a cancelled or timed-out job's completion report is rejected whatever the agent does. What
+the directive buys is *hardware time* — stopping a run that is already pointless.
+
+Losing one is bounded, because **the heartbeat is the durable redelivery path**. An agent reports its
+`running_jobs` on every beat; any job whose epoch has moved comes back `409 lease_lost` and is dropped.
+A directive lost to a restart therefore costs one heartbeat interval of wasted hardware, not the job's
+remaining runtime. Making the queue durable would mean a table, delivery acks and a redelivery policy —
+machinery to make a *hint* more reliable than the fencing token that already guarantees the result, and
+more reliable than the heartbeat that already redelivers it.
+
 **The epoch also protects terminal states.** Cancelling a running job bumps the epoch too (§6), which
 is what stops the agent's late "PASSED" from overwriting `CANCELLED`. The rule: **any transition that
 ends or reassigns ownership bumps the epoch.** Easier to remember than a list of cases.
@@ -1325,6 +1337,7 @@ tss/
 │   │   ├── matcher.py    # capability subset + N-of-M resource selection (pure)
 │   │   ├── scheduler.py  # queue walk, reservations, LRU; calls store.claim_all()
 │   │   ├── reaper.py     # sweep 1: presence expiry + fan-out.  sweep 2: job timeout.
+│   │   ├── directives.py # in-memory cancel/drain hints — deliberately not durable (§3.5)
 │   │   ├── events.py     # pub/sub abstraction
 │   │   └── config.py     # every timing constant, env-overridable
 │   ├── api/
@@ -1428,4 +1441,4 @@ leave idle.
    you can no longer afford to delete the database in order to deploy. Both arrive with the
    fleet-health work in §9. *Recommendation: name this trade explicitly rather than presenting the
    absence of migrations as an oversight — the reasoning is the answer.*
-6. **Historical duration estimates.** Needed before `tss why` can honestly show an ETA (§3.9).
+7. **Historical duration estimates.** Needed before `tss why` can honestly show an ETA (§3.9).

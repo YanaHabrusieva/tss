@@ -13,6 +13,7 @@ from fastapi import FastAPI
 
 from tss.api import agent, client
 from tss.core.config import Config
+from tss.core.directives import DirectiveQueue
 from tss.core.reaper import Reaper
 from tss.core.scheduler import Scheduler
 from tss.core.store import Store
@@ -25,11 +26,13 @@ def create_app(config: Config | None = None, store: Store | None = None) -> Fast
     store = store or Store(config.db_path, config)
 
     scheduler = Scheduler(store, config)
+    # A queued directive releases the agent's long-poll immediately.
+    directives = DirectiveQueue(on_push=scheduler.wake_agent)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store.init_schema()
-        reaper = Reaper(store, config, on_reap=scheduler.notify)
+        reaper = Reaper(store, config, on_reap=scheduler.notify, directives=directives)
         app.state.reaper = reaper
         reaper.start()
         scheduler.start()
@@ -45,6 +48,7 @@ def create_app(config: Config | None = None, store: Store | None = None) -> Fast
     app.state.store = store
     app.state.config = config
     app.state.scheduler = scheduler
+    app.state.directives = directives
     app.include_router(agent.router)
     app.include_router(agent.job_router)
     app.include_router(client.router)

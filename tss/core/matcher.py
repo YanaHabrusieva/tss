@@ -102,12 +102,24 @@ def match_on_agent(
     Each spec consumes a DISTINCT resource — a job needing two vehicle gateways
     must get two devices, not the same one twice.
 
-    Greedy in LRU order, which is exact while jobs need one device. When two
-    specs overlap on the same devices (`[{product: vg}, {product: vg, harness:
-    j1939}]`) a greedy walk can fail where an assignment exists; that needs
-    backtracking, and it arrives with multi-device jobs in step 5. Until then the
-    API rejects jobs with more than one requirement, so it is unreachable rather
-    than half-built.
+    WHAT THIS APPROXIMATES: **maximum bipartite matching** between requirement
+    specs and free devices. The greedy walk below is exact at N=1, which is all
+    the API currently accepts. At N>1 it can fail where a perfect matching
+    exists, whenever two specs overlap on the same devices:
+
+        specs   [{product: vg}, {product: vg, harness: j1939}]
+        devices vg-01 {harness: j1939}   vg-02 {harness: obd2}
+
+    Greedy hands vg-01 to the first spec (it matches, and it may sort first by
+    LRU), then finds nothing for the second — and reports "no match" for a job
+    that vg-01 + vg-02 could have run. That is a job left queued in front of
+    hardware that could run it, which is the utilization failure the whole
+    two-level model exists to avoid.
+
+    At N <= 4 devices per job, plain backtracking is enough and Hopcroft-Karp is
+    not worth the code. Step 5 turns multi-device on; this is what to reach for
+    then. Leaving it greedy until then keeps the exact case exact rather than
+    half-building the general one.
     """
     pool = offerable(resources)
     if not co_located(pool):

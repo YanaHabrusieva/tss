@@ -346,7 +346,7 @@ def test_the_reaper_loop_survives_a_failing_sweep(store, config, monkeypatch, ca
         task = asyncio.run(run_briefly())
 
     assert task.cancelled() or task.done()
-    assert "reaper sweep failed" in caplog.text
+    assert "presence sweep failed" in caplog.text
     assert "database went away" in caplog.text
 
 

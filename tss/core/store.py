@@ -28,6 +28,7 @@ from typing import Any
 
 from tss.core.config import DEFAULT, Config
 from tss.core.models import (
+    TERMINAL_JOB_STATES,
     Agent,
     AgentState,
     AgentView,
@@ -56,6 +57,13 @@ REASON_JOB_NOT_QUEUED = "job_not_queued"
 REASON_RESOURCE_COUNT_MISMATCH = "resource_count_mismatch"
 REASON_UNKNOWN_JOB = "unknown_job"
 REASON_DB_BUSY = "db_busy"
+
+# --- result_detail tokens. Every terminal record LEADS with one of these, so the
+# record says which path ended the job — that is what makes I6 checkable (§3.8).
+DETAIL_TIMEOUT = "timeout"  # sweep 2: the job hung, the bench was fine
+DETAIL_PRESENCE = "presence_expired"  # sweep 1: the machine died
+DETAIL_CANCELLED = "cancelled_by_client"
+DETAIL_REREGISTERED = "agent_reregistered"
 
 _BUSY_ERRCODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
 
@@ -459,7 +467,7 @@ class Store:
                 # Per JOB, not per resource — see reap_agent().
                 for job_id in self._distinct_jobs_on(conn, agent_id):
                     kind = self._requeue_job(
-                        conn, job_id, agent_id=agent_id, now=now, reason="agent_reregistered"
+                        conn, job_id, agent_id=agent_id, now=now, reason=DETAIL_REREGISTERED
                     )
                     if kind == "job.requeued":
                         requeued.append(job_id)
@@ -800,7 +808,7 @@ class Store:
         return [r["id"] for r in rows]
 
     def reap_agent(
-        self, agent_id: str, *, now: float | None = None, reason: str = "presence_expired"
+        self, agent_id: str, *, now: float | None = None, reason: str = DETAIL_PRESENCE
     ) -> ReapResult:
         """Mark a bench offline, free every device, requeue each job it held.
 
@@ -887,6 +895,169 @@ class Store:
             dead_lettered_jobs=dead_lettered,
         )
 
+    # ---------------------------------------------------- sweep 2: hung jobs
+    def timed_out_jobs(self, *, now: float | None = None) -> list[tuple[str, str]]:
+        """Sweep 2's query (§3.5): running past its budget.
+
+        Nothing here looks at presence. The agent is alive and heartbeating; the
+        JOB is what has stopped making progress. Collapsing this with presence
+        expiry is the most common design mistake in this system — a test that
+        legitimately takes 20 minutes must not look like a dead bench, and a
+        bench whose power supply died must not get 20 minutes of grace.
+        """
+        now = time.time() if now is None else now
+        rows = self.conn.execute(
+            """SELECT id, agent_id FROM jobs
+                WHERE state = 'running' AND ? > started_at + max_duration_s
+                ORDER BY id""",
+            (now,),
+        ).fetchall()
+        return [(r["id"], r["agent_id"]) for r in rows]
+
+    def time_out_job(self, job_id: str, *, now: float | None = None) -> str | None:
+        """Terminate one hung job. Returns the event kind, or None if it finished
+        while we were looking at it.
+
+        Retry ONCE, then dead-letter — counted in `job.timed_out` events, not in
+        `tried_agents`: a job that hangs on two different benches is hanging
+        because of itself, and blaming three benches for it would take three
+        machines out of rotation for a job that will hang on the fourth too.
+        """
+        now = time.time() if now is None else now
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT agent_id, epoch, max_duration_s, started_at FROM jobs "
+                "WHERE id = ? AND state = 'running'",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                self._rollback(conn)
+                return None
+            agent_id = row["agent_id"]
+
+            prior = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM events WHERE job_id = ? AND kind = 'job.timed_out'",
+                    (job_id,),
+                ).fetchone()["n"]
+            )
+            self._insert_event(
+                conn,
+                kind="job.timed_out",
+                ts=now,
+                agent_id=agent_id,
+                job_id=job_id,
+                detail={
+                    "elapsed_s": round(now - float(row["started_at"]), 3),
+                    "max_duration_s": row["max_duration_s"],
+                    "prior_timeouts": prior,
+                },
+            )
+            # The epoch bump inside here is what fences out the report the agent
+            # will eventually send for a run we have already given up on.
+            kind = self._requeue_job(
+                conn,
+                job_id,
+                agent_id=agent_id,
+                now=now,
+                reason=DETAIL_TIMEOUT,
+                force_dead_letter=prior >= 1,
+            )
+            if kind is None:
+                self._rollback(conn)
+                return None
+            # THIS job's devices only — the bench is fine and its other jobs are
+            # still running on it (§7.2).
+            conn.execute(
+                """UPDATE resources SET state = 'free', current_job_id = NULL
+                    WHERE current_job_id = :job_id AND state = 'busy'""",
+                {"job_id": job_id},
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            self._rollback(conn)
+            raise
+        return kind
+
+    # --------------------------------------------------------------- cancel
+    def cancel_job(self, job_id: str, *, now: float | None = None) -> str:
+        """Client cancel (§6). Queued dies quietly; running is fenced first.
+
+        The epoch bump is the whole point on the running path: it is what stops
+        the agent's late "PASSED" from overwriting CANCELLED. Without it, a job
+        an engineer cancelled reappears as a passing result minutes later (I7).
+        """
+        now = time.time() if now is None else now
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT state, agent_id FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                self._rollback(conn)
+                return "unknown_job"
+            if row["state"] in TERMINAL_JOB_STATES:
+                self._rollback(conn)
+                return "already_terminal"
+
+            was_running = row["state"] in (JobState.ASSIGNED, JobState.RUNNING)
+            cur = conn.execute(
+                """UPDATE jobs
+                      SET state = 'cancelled', outcome = 'cancelled',
+                          result_detail = :detail, finished_at = :now,
+                          epoch = epoch + 1
+                    WHERE id = :job_id
+                      AND state IN ('queued','assigned','running')""",
+                {"job_id": job_id, "now": now, "detail": DETAIL_CANCELLED},
+            )
+            if cur.rowcount != 1:
+                self._rollback(conn)
+                return "already_terminal"
+
+            conn.execute(
+                """UPDATE job_resources SET released_at = :now
+                    WHERE job_id = :job_id AND released_at IS NULL""",
+                {"now": now, "job_id": job_id},
+            )
+            conn.execute(
+                """UPDATE resources SET state = 'free', current_job_id = NULL
+                    WHERE current_job_id = :job_id AND state = 'busy'""",
+                {"job_id": job_id},
+            )
+            self._insert_event(
+                conn,
+                kind="job.cancelled",
+                ts=now,
+                agent_id=row["agent_id"],
+                job_id=job_id,
+                detail={"was_running": was_running},
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            self._rollback(conn)
+            raise
+        return "cancelled_running" if was_running else "cancelled"
+
+    # -------------------------------------------------------------- fencing
+    def fence_running_jobs(self, agent_id: str, reported: Sequence[tuple[str, int]]) -> str | None:
+        """Check what the agent believes it owns against the epoch (§6).
+
+        Returns the first job it has lost, or None. Each job is checked
+        INDEPENDENTLY: a bench running two jobs can lose one — cancelled, timed
+        out, or reassigned after a blip — and must keep the other. Returning the
+        job id is what lets the agent abandon exactly that run.
+        """
+        for job_id, epoch in reported:
+            job = self.get_job(job_id)
+            if job is None:
+                return job_id
+            if job.agent_id != agent_id or job.epoch != epoch or job.is_terminal:
+                return job_id
+        return None
+
     @staticmethod
     def _distinct_jobs_on(conn: sqlite3.Connection, agent_id: str) -> list[str]:
         """Per JOB, not per resource. The DISTINCT is the whole point (§3.5)."""
@@ -906,6 +1077,7 @@ class Store:
         agent_id: str,
         now: float,
         reason: str,
+        force_dead_letter: bool = False,
     ) -> str | None:
         """Take one job back. Returns the event kind emitted, or None if there was
         nothing to take back.
@@ -916,7 +1088,7 @@ class Store:
         defence behind the DISTINCT above.
         """
         row = conn.execute(
-            "SELECT state, epoch, tried_agents FROM jobs WHERE id = ?", (job_id,)
+            "SELECT state, epoch, attempt, tried_agents FROM jobs WHERE id = ?", (job_id,)
         ).fetchone()
         if row is None or row["state"] not in (JobState.ASSIGNED, JobState.RUNNING):
             return None
@@ -930,9 +1102,11 @@ class Store:
 
         # Poison detection keys off distinct benches, not the attempt count: a
         # counter cannot tell "this job kills every bench it touches" from "these
-        # three benches are broken".
+        # three benches are broken". `force_dead_letter` is the timeout sweep's
+        # separate rule — a job that hangs twice is hanging on its own, not
+        # because of the bench, so it gets one retry rather than three (§7.2).
         benches_tried = len(set(json.loads(row["tried_agents"])))
-        if benches_tried >= self.config.max_distinct_agents:
+        if force_dead_letter or benches_tried >= self.config.max_distinct_agents:
             # `state` says what happened; `outcome` says whose problem it is.
             # Dead-lettering only ever happens on the infra retry path — FAILED
             # is a real result and never retries (§4.2) — so the outcome is
@@ -950,11 +1124,21 @@ class Store:
         else:
             sql = """UPDATE jobs
                         SET state = 'queued', agent_id = NULL, epoch = epoch + 1,
-                            assigned_at = NULL, started_at = NULL
+                            assigned_at = NULL, started_at = NULL,
+                            result_detail = :detail
                       WHERE id = :job_id AND state IN ('assigned','running')"""
             kind = "job.requeued"
 
-        detail = f"{reason} after {benches_tried} benches"
+        # The detail always LEADS with the reason, so the record says which path
+        # ended this attempt. That is what makes I6 checkable at all: a hung job
+        # and a job on a dead bench are indistinguishable afterwards if both
+        # write the same string (§3.8).
+        if force_dead_letter:
+            detail = f"{reason} after {int(row['attempt'])} attempts"
+        elif benches_tried >= self.config.max_distinct_agents:
+            detail = f"{reason} after {benches_tried} benches"
+        else:
+            detail = reason
         params = {"job_id": job_id, "now": now, "reason": reason, "detail": detail}
         if conn.execute(sql, params).rowcount != 1:
             return None

@@ -16,6 +16,8 @@ files actually catch the bug they were written for.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import time
 from collections.abc import Callable, Sequence
@@ -23,6 +25,7 @@ from contextlib import contextmanager
 
 import pytest
 
+from tss.agent.daemon import TestbedAgent
 from tss.core.config import Config
 from tss.core.models import AgentState, ClaimResult, InventoryItem, ResourceState
 from tss.core.store import Store
@@ -175,6 +178,33 @@ def dispatch_server(db_path: str):
     """Normal leases, slow fallbacks — for dispatch and completion."""
     with running_server(db_path, DISPATCH_CONFIG) as running:
         yield running
+
+
+AGENT_ID = "bench-sf-01"
+
+
+def _devices(count: int) -> list[dict]:
+    return [{"id": f"vg-{i:02d}", "capabilities": DEVICE_CAPS} for i in range(1, count + 1)]
+
+
+class RunningAgent:
+    """The real daemon, in this test's event loop, talking over the socket."""
+
+    def __init__(self, base: str, agent_id: str = AGENT_ID, count: int = 3):
+        self.agent = TestbedAgent(agent_id, _devices(count), base_url=base, hostname="test.local")
+        self.stop = asyncio.Event()
+        self.task: asyncio.Task | None = None
+
+    async def __aenter__(self) -> TestbedAgent:
+        self.task = asyncio.create_task(self.agent.run(self.stop))
+        return self.agent
+
+    async def __aexit__(self, *exc):
+        self.stop.set()
+        if self.task is not None:
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.task
 
 
 #: What a Vehicle Gateway on a heavy-duty harness looks like to the matcher.

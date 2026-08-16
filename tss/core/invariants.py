@@ -12,7 +12,9 @@ Each function returns a list of human-readable violations — empty means it hol
 
 from __future__ import annotations
 
-from tss.core.models import AgentState, ResourceState
+import json
+
+from tss.core.models import TERMINAL_JOB_STATES, AgentState, ResourceState
 from tss.core.store import Store
 
 #: Job states in which a job is holding hardware.
@@ -82,8 +84,77 @@ def check_i8(store: Store) -> list[str]:
     ]
 
 
+def check_i6(store: Store) -> list[str]:
+    """A hung job is terminated by the job-timeout sweep, not by presence expiry.
+
+    This is only checkable because the two paths leave different records. Every
+    requeue and every dead-letter writes a `result_detail` that LEADS with the
+    reason that ended the attempt — `timeout...` from sweep 2, `presence_expired...`
+    from sweep 1 — and emits an event carrying the same reason. So the check is:
+    does the terminal record agree with the last thing that actually happened to
+    it?
+
+    If both paths wrote the same string there would be nothing to compare, I6
+    would be an assertion about the code rather than about the data, and the
+    `hung` chaos profile in step 5 would prove nothing.
+    """
+    violations = []
+    rows = store.conn.execute(
+        """SELECT j.id, j.state, j.result_detail,
+                  (SELECT e.detail FROM events e
+                    WHERE e.job_id = j.id
+                      AND e.kind IN ('job.requeued','job.dead_letter')
+                    ORDER BY e.seq DESC LIMIT 1) AS last_cause
+             FROM jobs j
+            WHERE j.state IN ('infra_error','dead_letter')"""
+    ).fetchall()
+    for row in rows:
+        if not row["last_cause"]:
+            continue
+        reason = json.loads(row["last_cause"]).get("reason")
+        detail = row["result_detail"] or ""
+        if reason and not detail.startswith(reason):
+            violations.append(
+                f"I6: {row['id']} ended via {reason!r} but its record says {detail!r} — "
+                "the two termination paths are indistinguishable"
+            )
+    return violations
+
+
+def check_i7(store: Store) -> list[str]:
+    """A terminal job's outcome is never overwritten.
+
+    Two halves. The event log must not show a job reaching a terminal state
+    twice — that is the late "PASSED" landing on top of a CANCELLED, which is
+    what the epoch bump on cancel exists to prevent. And the outcome column must
+    agree with the state: an outcome on a job that is still queued, or a terminal
+    job with no outcome at all, means something wrote half a transition.
+    """
+    violations = []
+    for row in store.conn.execute(
+        """SELECT job_id, COUNT(*) AS n, GROUP_CONCAT(kind) AS kinds
+             FROM events
+            WHERE kind IN ('job.completed','job.cancelled','job.dead_letter')
+              AND job_id IS NOT NULL
+            GROUP BY job_id HAVING n > 1"""
+    ):
+        violations.append(
+            f"I7: {row['job_id']} reached a terminal state {row['n']} times ({row['kinds']})"
+        )
+
+    for row in store.conn.execute("SELECT id, state, outcome FROM jobs"):
+        terminal = row["state"] in TERMINAL_JOB_STATES
+        if terminal and row["outcome"] is None:
+            violations.append(f"I7: {row['id']} is {row['state']} with no outcome recorded")
+        if not terminal and row["outcome"] is not None:
+            violations.append(
+                f"I7: {row['id']} is {row['state']} but already carries outcome={row['outcome']!r}"
+            )
+    return violations
+
+
 #: Every DB-checkable invariant, for the chaos watchdog and for tests.
-DB_CHECKS = (check_i2, check_i5, check_i8)
+DB_CHECKS = (check_i2, check_i5, check_i6, check_i7, check_i8)
 
 
 def check_all(store: Store) -> list[str]:

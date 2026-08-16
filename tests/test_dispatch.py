@@ -15,22 +15,16 @@ exactly the bug this asserts against.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import time
 
 import httpx
 import pytest
 
-from tests.conftest import DEVICE_CAPS
-from tss.agent.daemon import TestbedAgent
+from tests.conftest import RunningAgent
 from tss.core.invariants import check_all
 from tss.core.store import Store
 
 AGENT = "bench-sf-01"
-
-
-def devices(count: int) -> list[dict]:
-    return [{"id": f"vg-{i:02d}", "capabilities": DEVICE_CAPS} for i in range(1, count + 1)]
 
 
 async def poll_until(client: httpx.AsyncClient, path: str, predicate, *, timeout=15.0):
@@ -59,26 +53,6 @@ async def submit(client: httpx.AsyncClient, name: str, *, duration_s=0.2, outcom
     )
     assert response.status_code == 201, response.text
     return response.json()["job_id"]
-
-
-class RunningAgent:
-    """The real daemon, in this test's event loop, talking over the socket."""
-
-    def __init__(self, base: str, agent_id: str = AGENT, count: int = 3):
-        self.agent = TestbedAgent(agent_id, devices(count), base_url=base, hostname="test.local")
-        self.stop = asyncio.Event()
-        self.task: asyncio.Task | None = None
-
-    async def __aenter__(self) -> TestbedAgent:
-        self.task = asyncio.create_task(self.agent.run(self.stop))
-        return self.agent
-
-    async def __aexit__(self, *exc):
-        self.stop.set()
-        if self.task is not None:
-            self.task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self.task
 
 
 @pytest.mark.parametrize("count", [3])

@@ -7,6 +7,9 @@ Read `TSS-Architecture.md` before changing anything in `tss/core/`. It is the sp
 - An **AGENT** is a machine. It heartbeats and holds the presence lease. It has no `busy` state —
   capacity is counted, not flagged.
 - A **RESOURCE** is a device cabled to that machine. It is the unit of allocation.
+  States: `free | busy | unhealthy | retired`. `unhealthy` is present-but-broken (someone fixes
+  it); `retired` is no longer on the bench (it vanished from a re-registered inventory). Never
+  conflate them, and never hard-delete a resource that has `job_resources` history.
 - A **JOB** claims a *set* of resources, all on one agent (co-location), all-or-nothing.
 
 ## Non-negotiable invariants
@@ -21,7 +24,8 @@ Any change that could violate one of these needs a test proving it doesn't.
   Terminal = `passed | failed | infra_error | cancelled | dead_letter`. *(liveness, end-of-run)*
 - **I4** A job never runs on resources lacking its required capabilities. Verified against the agent's
   ground truth, not TSS's copy of what the agent claimed.
-- **I5** An `offline` agent's resources are all free and hold no job.
+- **I5** No resource of an `offline` agent is `busy` or holds a `current_job_id`. (Stated negatively
+  on purpose: "all free" was only true before `retired` existed, and would break on the next state.)
 - **I6** A hung job is terminated by the job-timeout sweep, not by presence expiry.
 - **I7** A terminal job's outcome is never overwritten.
 - **I8** A job in `assigned`/`running` holds **exactly** `resource_count` resources — never fewer,
@@ -56,8 +60,15 @@ Any change that could violate one of these needs a test proving it doesn't.
 - Presence leases belong to AGENTS, always, whatever their load. Resources have no lease.
 - Heartbeat renewal is guarded by `state != 'offline'`. A reaped agent gets `410 presence_expired` and
   re-registers; it must never renew itself back to life.
-- Reaper fan-out requeues per `SELECT DISTINCT current_job_id`, never per resource. A job on three
-  devices is requeued once, with one epoch bump and one `tried_agents` append.
+- Reap **releases claims and nothing else**: free only `state='busy'` resources, leaving `unhealthy`
+  and `retired` untouched. The agent is the authority on device health; TSS never infers it. A bench
+  crashing tells you nothing about whether a J-Link came back.
+- Reaper fan-out requeues per `SELECT DISTINCT current_job_id`, never per resource, and the requeue
+  is additionally guarded on `state IN ('assigned','running')`. A job on three devices is requeued
+  once, with one epoch bump.
+- `tried_agents` is appended at CLAIM time only, never on requeue — the bench is recorded when it
+  takes the job; appending again on the way out counts one bench twice. Poison detection counts
+  DISTINCT entries (`len(set(...))`), not list length.
 - Agent health and device health are separate. One bad device does not take the machine offline.
 - Presence timeout and job timeout are different things and must never be collapsed.
 

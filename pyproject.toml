@@ -18,6 +18,9 @@ dev = [
     "ruff>=0.7",
 ]
 
+[project.scripts]
+tss = "tss.cli.main:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

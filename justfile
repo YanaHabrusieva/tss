@@ -19,8 +19,9 @@ test *ARGS:
 # test_concurrency.py catch the bug they were written for (§7.5).
 #   TSS_CLAIM_IMPL=naive_cleanup just test-naive   # the release-on-failure variant
 test-naive *ARGS:
-    @echo "--- running against the NAIVE claim: failures here are the expected result ---"
-    TSS_CLAIM_IMPL="${TSS_CLAIM_IMPL:-naive}" {{py}} -m pytest tests/test_allocation.py tests/test_concurrency.py {{ARGS}}
+    @echo "--- running against the NAIVE claim + reap: failures here are the expected result ---"
+    -TSS_CLAIM_IMPL="${TSS_CLAIM_IMPL:-naive}" {{py}} -m pytest tests/test_allocation.py tests/test_concurrency.py {{ARGS}}
+    -TSS_REAP_IMPL=naive {{py}} -m pytest tests/test_fanout.py {{ARGS}}
 
 lint:
     {{py}} -m ruff check .
@@ -30,12 +31,19 @@ fmt:
     {{py}} -m ruff format .
     {{py}} -m ruff check --fix .
 
-# --- arriving in later steps of the build order (§10) -------------------------
+# The service: API + reaper, one process.
+serve PORT="8000":
+    {{py}} -m uvicorn tss.api.app:app --host 127.0.0.1 --port {{PORT}}
 
-# step 2: register + heartbeat + presence + `tss fleet`
-serve:
-    @echo "not yet: the API lands in step 2 (§10). Step 1 is the store and its tests."
-    @exit 1
+# One testbed agent with N devices cabled to it.
+agent ID="bench-sf-01" DEVICES="3":
+    {{py}} -m tss.agent.daemon --id {{ID}} --devices {{DEVICES}}
+
+# Benches and their devices.
+fleet:
+    {{py}} -m tss.cli.main fleet
+
+# --- arriving in later steps of the build order (§10) -------------------------
 
 # step 5: 15 agents x 2-4 devices, 100 jobs at 30% multi-device, 5 seeds — the merge gate
 chaos:

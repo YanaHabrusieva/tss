@@ -30,13 +30,22 @@ from tss.core.config import DEFAULT, Config
 from tss.core.models import (
     Agent,
     AgentState,
+    AgentView,
     CapabilitySpec,
     ClaimResult,
     Event,
+    FleetView,
+    InventoryItem,
     Job,
     JobState,
+    PresenceStatus,
+    ReapResult,
+    Registration,
     Resource,
     ResourceState,
+    ResourceView,
+    local_of,
+    qualify,
 )
 
 # --- claim failure reasons. None of these is an error; all are lost races. ------
@@ -68,7 +77,7 @@ CREATE TABLE IF NOT EXISTS resources (
     id                TEXT PRIMARY KEY,        -- "bench-sf-04:vg-01"
     agent_id          TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     capabilities      TEXT NOT NULL,           -- JSON: {"product":"vehicle_gateway",...}
-    state             TEXT NOT NULL CHECK (state IN ('free','busy','unhealthy')),
+    state             TEXT NOT NULL CHECK (state IN ('free','busy','unhealthy','retired')),
     current_job_id    TEXT REFERENCES jobs(id),  -- single column => I2 is structural
     last_assigned_at  REAL,                    -- drives LRU (§3.4)
     consecutive_fails INTEGER NOT NULL DEFAULT 0,
@@ -347,9 +356,408 @@ class Store:
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute("ROLLBACK")
 
+    # ------------------------------------------------- registration and presence
+    def register_agent(
+        self,
+        agent_id: str,
+        hostname: str,
+        inventory: Sequence[InventoryItem],
+        *,
+        agent_version: str | None = None,
+        now: float | None = None,
+    ) -> Registration:
+        """Register a bench and its devices. Idempotent (§6).
+
+        Re-registering an existing id replaces its inventory in place — never a
+        duplicate device. And it is not a no-op: a restarted agent has lost its
+        hardware state, so every job it held is requeued and every resource reset
+        to `free`, in this one transaction. Pretending it still owns those jobs
+        orphans them forever, with no lease left to expire them.
+
+        Quarantine survives a re-registration at the same `agent_version`: a
+        bench that was restarted but not fixed must stay out of rotation, or you
+        re-break the fleet one reboot at a time (§4.2).
+        """
+        now = time.time() if now is None else now
+        ttl = self.config.presence_ttl_s
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                "SELECT state, agent_version FROM agents WHERE id = ?", (agent_id,)
+            ).fetchone()
+            requeued: list[str] = []
+            dead_lettered: list[str] = []
+            quarantine_retained = False
+
+            if existing is None:
+                conn.execute(
+                    """INSERT INTO agents
+                           (id, hostname, state, presence_expires_at, last_heartbeat_at,
+                            registered_at, agent_version)
+                       VALUES (?, ?, 'online', ?, ?, ?, ?)""",
+                    (agent_id, hostname, now + ttl, now, now, agent_version),
+                )
+            else:
+                # Per JOB, not per resource — see reap_agent().
+                for job_id in self._distinct_jobs_on(conn, agent_id):
+                    kind = self._requeue_job(
+                        conn, job_id, agent_id=agent_id, now=now, reason="agent_reregistered"
+                    )
+                    if kind == "job.requeued":
+                        requeued.append(job_id)
+                    elif kind == "job.dead_letter":
+                        dead_lettered.append(job_id)
+
+                quarantine_retained = (
+                    existing["state"] == AgentState.QUARANTINED
+                    and existing["agent_version"] == agent_version
+                )
+                conn.execute(
+                    """UPDATE agents
+                          SET hostname            = :hostname,
+                              state               = :state,
+                              presence_expires_at = :expires,
+                              last_heartbeat_at   = :now,
+                              registered_at       = :now,
+                              agent_version       = :version,
+                              quarantined_at      = :quarantined_at
+                        WHERE id = :agent_id""",
+                    {
+                        "hostname": hostname,
+                        "state": (
+                            AgentState.QUARANTINED if quarantine_retained else AgentState.ONLINE
+                        ).value,
+                        "expires": now + ttl,
+                        "now": now,
+                        "version": agent_version,
+                        "quarantined_at": now if quarantine_retained else None,
+                        "agent_id": agent_id,
+                    },
+                )
+
+            resource_ids = [qualify(agent_id, item.id) for item in inventory]
+            retired = self._replace_inventory(conn, agent_id, inventory, keep=set(resource_ids))
+
+            self._insert_event(
+                conn,
+                kind="agent.registered",
+                ts=now,
+                agent_id=agent_id,
+                detail={
+                    "is_new": existing is None,
+                    "resources": [local_of(r) for r in resource_ids],
+                    "requeued": requeued,
+                    "dead_lettered": dead_lettered,
+                    "retired": [local_of(r) for r in retired],
+                    "agent_version": agent_version,
+                },
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            self._rollback(conn)
+            raise
+
+        return Registration(
+            agent_id=agent_id,
+            is_new=existing is None,
+            requeued_jobs=requeued,
+            dead_lettered_jobs=dead_lettered,
+            resource_ids=resource_ids,
+            retired_resource_ids=retired,
+            quarantine_retained=quarantine_retained,
+        )
+
+    @staticmethod
+    def _replace_inventory(
+        conn: sqlite3.Connection,
+        agent_id: str,
+        inventory: Sequence[InventoryItem],
+        *,
+        keep: set[str],
+    ) -> list[str]:
+        """Upsert what the agent reports; retire what it no longer does.
+
+        ONE RULE: a device that vanished from the inventory becomes `retired`,
+        always — whether or not it has allocation history. Deleting the ones
+        without history and retiring the ones with it would be two rules for one
+        situation, and the fleet view would then depend on whether a device
+        happened to have run something before it was unplugged.
+
+        Never `unhealthy`: that means present-but-broken, and someone is expected
+        to go fix it. A retired device is not there to fix (§4.2).
+        """
+        retired: list[str] = []
+        current = {
+            row["id"]
+            for row in conn.execute("SELECT id FROM resources WHERE agent_id = ?", (agent_id,))
+        }
+        for resource_id in sorted(current - keep):
+            conn.execute(
+                "UPDATE resources SET state = 'retired', current_job_id = NULL WHERE id = ?",
+                (resource_id,),
+            )
+            retired.append(resource_id)
+
+        for item in inventory:
+            conn.execute(
+                """INSERT INTO resources (id, agent_id, capabilities, state)
+                        VALUES (:id, :agent_id, :capabilities, 'free')
+                   ON CONFLICT(id) DO UPDATE
+                          SET capabilities   = excluded.capabilities,
+                              agent_id       = excluded.agent_id,
+                              state          = 'free',
+                              current_job_id = NULL""",
+                {
+                    "id": qualify(agent_id, item.id),
+                    "agent_id": agent_id,
+                    "capabilities": json.dumps(item.capabilities),
+                },
+            )
+        return retired
+
+    def renew_presence(
+        self, agent_id: str, *, now: float | None = None
+    ) -> tuple[PresenceStatus, Agent | None]:
+        """Push the presence lease forward — the whole of "I'm alive" (§3.5).
+
+        The `state != 'offline'` guard is the point. A heartbeat that lands
+        microseconds after the reaper ran must NOT resurrect the lease: the agent
+        would go on believing it owns resources that have already been freed and
+        handed to someone else. It gets 410 instead, re-registers, and comes back
+        clean — without its jobs.
+        """
+        now = time.time() if now is None else now
+        conn = self.conn
+        cur = conn.execute(
+            """UPDATE agents
+                  SET presence_expires_at = :expires,
+                      last_heartbeat_at   = :now
+                WHERE id = :agent_id
+                  AND state != 'offline'""",
+            {"expires": now + self.config.presence_ttl_s, "now": now, "agent_id": agent_id},
+        )
+        if cur.rowcount == 1:
+            return PresenceStatus.RENEWED, self.get_agent(agent_id)
+        agent = self.get_agent(agent_id)
+        if agent is None:
+            return PresenceStatus.UNKNOWN_AGENT, None
+        return PresenceStatus.EXPIRED, agent
+
+    def report_resource_health(
+        self, agent_id: str, health: dict[str, str], *, now: float | None = None
+    ) -> list[str]:
+        """Apply the agent's own device probes (§3.1, §4.2).
+
+        Device health and machine health are different things: one dead J-Link
+        costs you one device, not the bench. A `busy` device is left alone — its
+        job has to end before the device can change state, and that path arrives
+        with completion in step 3. A `retired` device is left alone too: the
+        transitions below are guarded to free<->unhealthy, so a stale health
+        report cannot bring a device that is no longer on the bench back into the
+        pool.
+        """
+        now = time.time() if now is None else now
+        changed: list[str] = []
+        for local, status in sorted(health.items()):
+            resource_id = qualify(agent_id, local)
+            if status == ResourceState.UNHEALTHY:
+                sql, kind = (
+                    "UPDATE resources SET state = 'unhealthy' WHERE id = ? AND state = 'free'",
+                    "resource.unhealthy",
+                )
+            elif status in (ResourceState.FREE, "healthy"):
+                sql, kind = (
+                    "UPDATE resources SET state = 'free' WHERE id = ? AND state = 'unhealthy'",
+                    "resource.healthy",
+                )
+            else:
+                continue
+            if self.conn.execute(sql, (resource_id,)).rowcount == 1:
+                changed.append(resource_id)
+                self.append_event(kind, agent_id=agent_id, resource_id=resource_id, now=now)
+        return changed
+
+    # ------------------------------------------------------------- the reaper
+    def expired_agents(self, *, now: float | None = None) -> list[str]:
+        """Sweep 1's query (§3.5). A lease has no opinion: time passes, it expires.
+
+        Note what is *not* here: any notion of how loaded the bench is. Presence
+        belongs to the machine, always, so a bench unplugged while idle expires
+        exactly like one that died mid-job — the hole that fails Pillar 4 if you
+        only lease busy agents.
+        """
+        now = time.time() if now is None else now
+        rows = self.conn.execute(
+            """SELECT id FROM agents
+                WHERE presence_expires_at < ? AND state != 'offline'
+                ORDER BY id""",
+            (now,),
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def reap_agent(
+        self, agent_id: str, *, now: float | None = None, reason: str = "presence_expired"
+    ) -> ReapResult:
+        """Mark a bench offline, free every device, requeue each job it held.
+
+        THE FAN-OUT. Jobs are collected with SELECT DISTINCT and requeued once
+        each. A bench running one job across three devices appears three times if
+        you iterate resources — requeue per resource and you bump the epoch three
+        times and burn the job's whole retry budget on a single bench failure.
+        Nothing errors; the job just mysteriously dead-letters early.
+
+        `tried_agents` is NOT appended here. The bench was recorded when it
+        claimed the job (§3.3); appending again on the way out would count one
+        bench twice.
+
+        The sweep releases claims and nothing else — see the resource UPDATE
+        below for why `unhealthy` and `retired` are left alone.
+        """
+        now = time.time() if now is None else now
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Taking the agent offline is also this reap's claim on the work: a
+            # second sweep racing us finds rowcount 0 and does nothing.
+            if (
+                conn.execute(
+                    "UPDATE agents SET state = 'offline' WHERE id = ? AND state != 'offline'",
+                    (agent_id,),
+                ).rowcount
+                != 1
+            ):
+                self._rollback(conn)
+                return ReapResult(agent_id=agent_id)
+
+            requeued: list[str] = []
+            dead_lettered: list[str] = []
+            for job_id in self._distinct_jobs_on(conn, agent_id):
+                kind = self._requeue_job(conn, job_id, agent_id=agent_id, now=now, reason=reason)
+                if kind == "job.requeued":
+                    requeued.append(job_id)
+                elif kind == "job.dead_letter":
+                    dead_lettered.append(job_id)
+
+            freed = [
+                row["id"]
+                for row in conn.execute(
+                    "SELECT id FROM resources WHERE agent_id = ? AND state = 'busy' ORDER BY id",
+                    (agent_id,),
+                )
+            ]
+            # A reap releases CLAIMS. That is all it knows about.
+            #
+            # I5 is the negative statement — no resource of an offline agent is
+            # busy or holds a job — and `state = 'busy'` is exactly what it takes
+            # to satisfy it. `unhealthy` and `retired` are left as they were: TSS
+            # never infers device health, the agent reports it. Marking a broken
+            # device free because its machine died would be TSS deciding the
+            # J-Link got fixed, and no exception for `retired` is needed once the
+            # update only touches what was claimed.
+            conn.execute(
+                """UPDATE resources SET state = 'free', current_job_id = NULL
+                    WHERE agent_id = ? AND state = 'busy'""",
+                (agent_id,),
+            )
+            self._insert_event(
+                conn,
+                kind="agent.offline",
+                ts=now,
+                agent_id=agent_id,
+                detail={
+                    "reason": reason,
+                    "requeued": requeued,
+                    "dead_lettered": dead_lettered,
+                    "freed_resources": [local_of(r) for r in freed],
+                },
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            self._rollback(conn)
+            raise
+
+        return ReapResult(
+            agent_id=agent_id,
+            freed_resources=freed,
+            requeued_jobs=requeued,
+            dead_lettered_jobs=dead_lettered,
+        )
+
+    @staticmethod
+    def _distinct_jobs_on(conn: sqlite3.Connection, agent_id: str) -> list[str]:
+        """Per JOB, not per resource. The DISTINCT is the whole point (§3.5)."""
+        rows = conn.execute(
+            """SELECT DISTINCT current_job_id FROM resources
+                WHERE agent_id = ? AND current_job_id IS NOT NULL
+                ORDER BY current_job_id""",
+            (agent_id,),
+        ).fetchall()
+        return [r["current_job_id"] for r in rows]
+
+    def _requeue_job(
+        self,
+        conn: sqlite3.Connection,
+        job_id: str,
+        *,
+        agent_id: str,
+        now: float,
+        reason: str,
+    ) -> str | None:
+        """Take one job back. Returns the event kind emitted, or None if there was
+        nothing to take back.
+
+        Guarded on `state IN ('assigned','running')`: a job that has already
+        reached a terminal state is never resurrected (I7), and a job that is
+        already queued is never requeued a second time — the second line of
+        defence behind the DISTINCT above.
+        """
+        row = conn.execute(
+            "SELECT state, epoch, tried_agents FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None or row["state"] not in (JobState.ASSIGNED, JobState.RUNNING):
+            return None
+
+        epoch = int(row["epoch"])
+        conn.execute(
+            """UPDATE job_resources SET released_at = :now
+                WHERE job_id = :job_id AND epoch = :epoch AND released_at IS NULL""",
+            {"now": now, "job_id": job_id, "epoch": epoch},
+        )
+
+        # Poison detection keys off distinct benches, not the attempt count: a
+        # counter cannot tell "this job kills every bench it touches" from "these
+        # three benches are broken".
+        benches_tried = len(set(json.loads(row["tried_agents"])))
+        if benches_tried >= self.config.max_distinct_agents:
+            sql = """UPDATE jobs
+                        SET state = 'dead_letter', outcome = 'dead_letter',
+                            result_detail = :reason, agent_id = NULL,
+                            epoch = epoch + 1, finished_at = :now
+                      WHERE id = :job_id AND state IN ('assigned','running')"""
+            kind = "job.dead_letter"
+        else:
+            sql = """UPDATE jobs
+                        SET state = 'queued', agent_id = NULL, epoch = epoch + 1,
+                            assigned_at = NULL, started_at = NULL
+                      WHERE id = :job_id AND state IN ('assigned','running')"""
+            kind = "job.requeued"
+
+        if conn.execute(sql, {"job_id": job_id, "now": now, "reason": reason}).rowcount != 1:
+            return None
+        self._insert_event(
+            conn,
+            kind=kind,
+            ts=now,
+            agent_id=agent_id,
+            job_id=job_id,
+            detail={"reason": reason, "epoch": epoch + 1, "benches_tried": benches_tried},
+        )
+        return kind
+
     # ------------------------------------------------------------- fleet writes
-    # Minimal creation paths for step 1. Idempotent registration with inventory
-    # replacement, and the requeue-on-re-register rule (§6), arrive in step 2.
+    # Minimal creation paths kept from step 1 for tests that want a bench without
+    # going through registration.
     def create_agent(
         self,
         agent_id: str,
@@ -509,6 +917,54 @@ class Store:
             params = (job_id,)
         sql += " ORDER BY job_id, resource_id, epoch"
         return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    def fleet(self, *, now: float | None = None) -> FleetView:
+        """The two-level fleet view (§3.9): benches, each with its devices.
+
+        An OFFLINE bench also carries what it took down with it, read back out of
+        the `agent.offline` event so the view can say "3 devices free, 2 jobs
+        requeued" instead of just going blank.
+        """
+        now = time.time() if now is None else now
+        by_agent: dict[str, list[ResourceView]] = {}
+        for resource in self.list_resources():
+            by_agent.setdefault(resource.agent_id, []).append(
+                ResourceView(
+                    id=resource.id,
+                    local_id=local_of(resource.id),
+                    state=resource.state,
+                    current_job_id=resource.current_job_id,
+                    capabilities=resource.capabilities,
+                )
+            )
+
+        agents: list[AgentView] = []
+        for row in self.conn.execute("SELECT * FROM agents ORDER BY id"):
+            agent = Agent.from_row(row)
+            requeued: list[str] = []
+            if agent.state == AgentState.OFFLINE:
+                last = self.conn.execute(
+                    """SELECT detail FROM events
+                        WHERE kind = 'agent.offline' AND agent_id = ?
+                        ORDER BY seq DESC LIMIT 1""",
+                    (agent.id,),
+                ).fetchone()
+                if last and last["detail"]:
+                    requeued = json.loads(last["detail"]).get("requeued", [])
+            agents.append(
+                AgentView(
+                    id=agent.id,
+                    hostname=agent.hostname,
+                    state=agent.state,
+                    agent_version=agent.agent_version,
+                    last_heartbeat_at=agent.last_heartbeat_at,
+                    presence_expires_at=agent.presence_expires_at,
+                    seconds_since_beat=max(0.0, now - agent.last_heartbeat_at),
+                    resources=by_agent.get(agent.id, []),
+                    requeued_on_last_reap=requeued,
+                )
+            )
+        return FleetView(now=now, agents=agents)
 
     def events(self, *, kind: str | None = None, job_id: str | None = None) -> list[Event]:
         clauses: list[str] = []

@@ -30,7 +30,22 @@ class AgentState(StrEnum):
 class ResourceState(StrEnum):
     FREE = "free"
     BUSY = "busy"
+    #: Present but broken — a dropped J-Link, an unresponsive DUT. Someone can
+    #: walk over and fix it, and the bench keeps working on its other devices.
     UNHEALTHY = "unhealthy"
+    #: Gone — it vanished from the inventory when the agent re-registered. Never
+    #: deleted (`job_resources` records which devices a past attempt ran on),
+    #: never matched, and hidden from the default fleet view. Parking these in
+    #: `unhealthy` instead would fill the fleet view with ghosts nobody can ever
+    #: repair (§4.2).
+    RETIRED = "retired"
+
+
+#: States a device can never be allocated from. The claim's own `state='free'`
+#: guard is what enforces it; this is for the matcher and the fleet view.
+UNSCHEDULABLE_RESOURCE_STATES: frozenset[ResourceState] = frozenset(
+    {ResourceState.UNHEALTHY, ResourceState.RETIRED}
+)
 
 
 class JobState(StrEnum):
@@ -170,6 +185,95 @@ class ClaimResult(BaseModel):
 
     def __bool__(self) -> bool:
         return self.ok
+
+
+class InventoryItem(BaseModel):
+    """One device, as the agent reports it (§6). `id` is bench-local ("vg-01");
+    TSS qualifies it to "bench-sf-04:vg-01" so ids are unique fleet-wide."""
+
+    id: str
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+
+
+class PresenceStatus(StrEnum):
+    """Outcome of a heartbeat's presence renewal (§3.5)."""
+
+    RENEWED = "renewed"
+    UNKNOWN_AGENT = "unknown_agent"  # -> 404, agent registers
+    EXPIRED = "presence_expired"  # -> 410, agent re-registers. It does NOT get its jobs back.
+
+
+class Registration(BaseModel):
+    """What a register call did. Re-registering is not free: a bench that comes
+    back has lost its hardware state, so everything it held is requeued (§6)."""
+
+    agent_id: str
+    is_new: bool
+    requeued_jobs: list[str] = Field(default_factory=list)
+    dead_lettered_jobs: list[str] = Field(default_factory=list)
+    resource_ids: list[str] = Field(default_factory=list)
+    #: Devices that were on this bench last time and are not in the new inventory.
+    retired_resource_ids: list[str] = Field(default_factory=list)
+    quarantine_retained: bool = False
+
+
+class ReapResult(BaseModel):
+    """One dead bench, swept. `requeued_jobs` is per *job*, not per resource —
+    a job spanning three devices appears once (§3.5)."""
+
+    agent_id: str
+    freed_resources: list[str] = Field(default_factory=list)
+    requeued_jobs: list[str] = Field(default_factory=list)
+    dead_lettered_jobs: list[str] = Field(default_factory=list)
+
+
+class ResourceView(BaseModel):
+    id: str
+    local_id: str
+    state: ResourceState
+    current_job_id: str | None = None
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentView(BaseModel):
+    """One bench and the devices cabled to it — the two-level fleet view (§3.9)."""
+
+    id: str
+    hostname: str
+    state: AgentState
+    agent_version: str | None = None
+    last_heartbeat_at: float
+    presence_expires_at: float
+    seconds_since_beat: float
+    resources: list[ResourceView] = Field(default_factory=list)
+    #: Filled in for benches that were reaped, so the fleet view can say what the
+    #: machine took down with it.
+    requeued_on_last_reap: list[str] = Field(default_factory=list)
+
+    @property
+    def busy(self) -> int:
+        return sum(1 for r in self.resources if r.state == ResourceState.BUSY)
+
+    @property
+    def total(self) -> int:
+        """Capacity — retired devices are gone, so they are not capacity."""
+        return sum(1 for r in self.resources if r.state != ResourceState.RETIRED)
+
+
+class FleetView(BaseModel):
+    now: float
+    agents: list[AgentView] = Field(default_factory=list)
+
+
+def qualify(agent_id: str, local_id: str) -> str:
+    """Bench-local device name -> fleet-wide resource id."""
+    return local_id if local_id.startswith(f"{agent_id}:") else f"{agent_id}:{local_id}"
+
+
+def local_of(resource_id: str) -> str:
+    """Fleet-wide resource id -> the name the bench knows it by."""
+    _, _, local = resource_id.partition(":")
+    return local or resource_id
 
 
 class Event(BaseModel):

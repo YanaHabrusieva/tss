@@ -17,11 +17,13 @@ files actually catch the bug they were written for.
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable, Sequence
 
 import pytest
 
-from tss.core.models import ClaimResult
+from tss.core.config import Config
+from tss.core.models import AgentState, ClaimResult, InventoryItem, ResourceState
 from tss.core.store import Store
 
 ClaimFn = Callable[[Store, str, str, Sequence[str]], ClaimResult]
@@ -57,17 +59,105 @@ def claim(claim_impl: str) -> ClaimFn:
     return atomic
 
 
+REAP_IMPL_ENV = "TSS_REAP_IMPL"
+
+
+@pytest.fixture(scope="session")
+def reap_impl() -> str:
+    impl = os.environ.get(REAP_IMPL_ENV, "fanout")
+    if impl not in {"fanout", "naive"}:
+        raise ValueError(f"{REAP_IMPL_ENV} must be 'fanout' or 'naive', got {impl!r}")
+    return impl
+
+
+@pytest.fixture
+def reap(reap_impl: str):
+    """The presence-sweep requeue under test — see `claim` above for the pattern."""
+    if reap_impl == "naive":
+        from tests.naive_reap import naive_reap_agent
+
+        return naive_reap_agent
+
+    def fanout(store: Store, agent_id: str, *, now: float | None = None, **kw):
+        return store.reap_agent(agent_id, now=now, **kw)
+
+    return fanout
+
+
 @pytest.fixture
 def db_path(tmp_path) -> str:
     return str(tmp_path / "tss.db")
 
 
 @pytest.fixture
-def store(db_path: str) -> Store:
-    s = Store(db_path)
+def config() -> Config:
+    return Config()
+
+
+@pytest.fixture
+def store(db_path: str, config: Config) -> Store:
+    s = Store(db_path, config)
     s.init_schema()
     yield s
     s.close()
+
+
+#: Short-lease config for tests that must use a real clock. The ratios still hold
+#: (TTL = 4 x heartbeat; TTL > longpoll + heartbeat), just scaled down 12x.
+FAST_CONFIG = Config(
+    heartbeat_interval_s=0.25,
+    presence_ttl_s=1.0,
+    reaper_interval_s=0.2,
+    longpoll_timeout_s=0.5,
+)
+
+
+@pytest.fixture
+def live_server(db_path: str):
+    """A real uvicorn on a real socket, on an ephemeral port.
+
+    CLAUDE.md: integration tests go over real HTTP, never a mocked transport —
+    mocked tests pass while the real thing deadlocks. This costs about a second
+    of startup and is the only way the 404/410 handshake means anything.
+    """
+    import threading
+
+    import uvicorn
+
+    from tss.api.app import create_app
+
+    store = Store(db_path, FAST_CONFIG)
+    app = create_app(FAST_CONFIG, store)
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="on")
+    )
+    thread = threading.Thread(target=server.run, name="tss-test-server", daemon=True)
+    thread.start()
+
+    deadline = time.monotonic() + 15
+    while not server.started:
+        if time.monotonic() > deadline:  # pragma: no cover
+            raise RuntimeError("test server did not start")
+        time.sleep(0.02)
+    port = server.servers[0].sockets[0].getsockname()[1]
+
+    try:
+        yield f"http://127.0.0.1:{port}", FAST_CONFIG
+    finally:
+        server.should_exit = True
+        thread.join(timeout=15)
+
+
+#: What a Vehicle Gateway on a heavy-duty harness looks like to the matcher.
+DEVICE_CAPS = {"product": "vehicle_gateway", "harness": "j1939"}
+
+
+def inventory(count: int, *, caps: dict | None = None) -> list[InventoryItem]:
+    """`count` identical devices, as an agent would report them (bench-local ids)."""
+    return [
+        InventoryItem(id=f"vg-{i:02d}", capabilities=dict(caps or DEVICE_CAPS))
+        for i in range(1, count + 1)
+    ]
 
 
 def make_bench(store: Store, agent_id: str, devices: dict[str, dict] | list[str]) -> list[str]:
@@ -81,6 +171,20 @@ def make_bench(store: Store, agent_id: str, devices: dict[str, dict] | list[str]
         store.add_resource(rid, agent_id, caps)
         ids.append(rid)
     return ids
+
+
+def assert_i5(store: Store, agent_id: str) -> None:
+    """I5, in the negative form the spec states it in: no resource of an offline
+    agent is busy or holds a `current_job_id`.
+
+    Stated positively ("all free") it would be wrong — a device that was broken,
+    or that has been unplugged from the bench, is still broken or unplugged after
+    the machine dies. The reap releases claims; it does not diagnose hardware.
+    """
+    assert store.get_agent(agent_id).state == AgentState.OFFLINE
+    for resource in store.list_resources(agent_id):
+        assert resource.state != ResourceState.BUSY, f"I5: {resource.id} still busy"
+        assert resource.current_job_id is None, f"I5: {resource.id} still holds a job"
 
 
 def submit(store: Store, job_id: str, n_devices: int, *, name: str | None = None) -> None:

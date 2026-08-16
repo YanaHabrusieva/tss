@@ -446,16 +446,43 @@ SELECT DISTINCT current_job_id FROM resources
  WHERE agent_id = :agent AND current_job_id IS NOT NULL;
 ```
 
-Mark the agent `offline`; free every one of its resources; and requeue **each distinct job** it was
+Mark the agent `offline`; **release every claim it holds** (`WHERE agent_id = ? AND state = 'busy'`);
+and requeue **each distinct job** it was
 running — `state='queued'`, `agent_id=NULL`, `epoch = epoch + 1` — or dead-letter jobs that have now
 failed on `MAX_DISTINCT_AGENTS` distinct benches. Emit `agent.offline` and one `job.requeued` per job.
 Poke the scheduler.
 
+> **Reap releases claims. It does not touch health.** Free only the resources that are `busy`;
+> leave `unhealthy` and `retired` exactly as they are. The temptation is to reset everything to `free`
+> on the way out, and it is wrong for the same reason everything else in this design is arranged the
+> way it is: **the agent is the authority on device health, and TSS never infers it.** A bench dying
+> tells you nothing about whether its J-Link came back, and a device that vanished from the inventory
+> certainly did not reappear because the machine crashed. Resetting state you cannot observe puts a
+> known-bad device back in the schedulable pool until the next health report, and silently resurrects
+> retired ghosts.
+>
+> This also makes I5 the right shape. "All resources are free" was only ever true by accident — it
+> broke the moment a second non-schedulable state existed, and it would break again on the next one.
+> State the invariant negatively — *nothing here is `busy` or holds a job* — and it survives states
+> you have not invented yet. Safety invariants should say what must not happen, not enumerate what
+> must.
+
 > **`DISTINCT` is not decoration.** A bench running one job across three of its devices appears three
-> times if you iterate resources. Requeue it per-resource and you bump the epoch three times, append
-> the agent to `tried_agents` three times, and burn the job's entire retry budget on a single bench
-> failure. This is the most likely bug in the whole fan-out and it is completely silent — the job just
-> mysteriously dead-letters early. Dedupe by job, then requeue once.
+> times if you iterate resources. Requeue it per-resource and you bump the epoch three times — and,
+> worse, the second and third requeues act on a job the scheduler may already have reassigned, yanking
+> a freshly started run back into the queue for no reason. Dedupe by job, then requeue once.
+>
+> **`tried_agents` is *not* appended here.** The bench was recorded when it claimed the job (§3.3);
+> appending again on the way out would count one bench twice and dead-letter a healthy job early.
+> Requeue bumps the epoch and releases the devices — it does not touch the list.
+>
+> **Guard the requeue on `state IN ('assigned','running')` as well.** A job that already reached a
+> terminal state is never resurrected (that is I7 falling out for free), and a job already back in the
+> queue is never requeued twice. With the whole sweep in one transaction the guard and the `DISTINCT`
+> are two independent defences against the same bug — which is the right posture for an invariant. Note
+> the dependency, though: if the sweep were *per-job* transactions rather than one, the scheduler could
+> reassign between requeues and the guard alone would not save you. `DISTINCT` would then be carrying
+> it on its own.
 
 *Sweep 2 — hung jobs:*
 
@@ -608,7 +635,7 @@ show two owners because the reaper clears the dead one. Checking TSS against its
 | I2 | No **resource** is held by two jobs | safety | DB — structural, see below |
 | I3 | Every submitted job reaches a terminal state within the run deadline | **liveness** | DB, end of run |
 | I4 | A job never runs on resources lacking its required capabilities | safety | **agent ground truth**, not TSS's copy |
-| I5 | An `offline` agent's resources are all free, and hold no job | safety | DB |
+| I5 | No resource of an `offline` agent is `busy` or holds a `current_job_id` | safety | DB |
 | I6 | A hung job is terminated by the job-timeout sweep, not by presence expiry | safety | DB + timing |
 | I7 | A terminal job's outcome is never overwritten | safety | DB, event log |
 | **I8** | **A job in `assigned`/`running` holds exactly as many resources as it required — never fewer, never more** | safety | DB |
@@ -758,6 +785,16 @@ Splitting agent from resource gives two small machines instead of one overloaded
 - **BUSY** — claimed by exactly one job.
 - **UNHEALTHY** — this specific device is bad (J-Link dropped, DUT unresponsive) while the machine is
   fine. Skipped by the matcher; the bench keeps working on its other devices.
+- **RETIRED** — the device is *gone*: it disappeared from the inventory when the agent re-registered.
+  Skipped by the matcher and hidden from the default fleet view, but never deleted — `job_resources`
+  still needs to record which devices a past attempt ran on.
+
+**`unhealthy` and `retired` must not be the same state.** One means *present but broken* — someone
+walks over and fixes it. The other means *not there* — someone unplugged it or moved it to another
+bench. Park vanished devices in `unhealthy` and your fleet view slowly fills with ghosts nobody can
+ever repair; at 1,000 benches that noise is how a fleet view stops being trusted. It is the same
+discipline as agent-health versus device-health, and as `FAILED` versus `INFRA_ERROR`: when two
+conditions call for different human responses, they get different names.
 
 **Why device-level health matters.** One dead J-Link on a three-device bench should cost you one
 device, not the bench. Conflating them is how you lose a third of your fleet to a single unplugged
@@ -846,7 +883,7 @@ CREATE TABLE resources (
     id                TEXT PRIMARY KEY,        -- "bench-sf-04:vg-01"
     agent_id          TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     capabilities      TEXT NOT NULL,           -- JSON: {"product":"vehicle_gateway","harness":"j1939"}
-    state             TEXT NOT NULL CHECK (state IN ('free','busy','unhealthy')),
+    state             TEXT NOT NULL CHECK (state IN ('free','busy','unhealthy','retired')),
     current_job_id    TEXT REFERENCES jobs(id),  -- single column ⇒ I2 is structural
     last_assigned_at  REAL,                    -- drives LRU (§3.4)
     consecutive_fails INTEGER NOT NULL DEFAULT 0,
@@ -1059,9 +1096,10 @@ Five that actually bite here:
    → Renewal guarded by `state != 'offline'`; the agent gets `410` and re-registers (§3.5).
    *Most likely to be generated incorrectly, because renewal looks trivial.*
 5. **Fan-out double-requeue** — a dead bench running one job on three devices requeues that job three
-   times, bumping the epoch and burning the retry budget in one go.
-   → `SELECT DISTINCT current_job_id` and requeue per **job**, not per resource (§3.5). *This one is
-   silent: nothing errors, the job just dead-letters early.*
+   times, bumping the epoch three times and potentially yanking back a run the scheduler had already
+   reassigned mid-sweep.
+   → `SELECT DISTINCT current_job_id` and requeue per **job**, not per resource, plus a
+   `state IN ('assigned','running')` guard (§3.5). *This one is silent: nothing errors.*
 
 Plus the classic: **lost wakeup** — a resource frees up mid-pass, the notify is dropped, and the queue
 stalls with free devices sitting there. Clear the notify event *before* reading state, not after, and

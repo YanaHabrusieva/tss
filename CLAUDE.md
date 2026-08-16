@@ -83,6 +83,11 @@ Any change that could violate one of these needs a test proving it doesn't.
 - Retry and poison decisions key off `tried_agents` (distinct benches), not `attempt`.
 - `FAILED` is terminal and never auto-retried. Only `INFRA_ERROR` retries. A hung job is
   `infra_error:timeout`, never `failed`.
+- `state` says what happened; `outcome` says whose problem it is. A dead-lettered job is
+  `state='dead_letter'`, `outcome='infra_error'` — never `outcome='dead_letter'`. Repeating the state
+  in the outcome discards the FAILED-vs-INFRA_ERROR distinction on exactly the jobs that failed worst.
+- The scheduler SKIPS jobs it cannot satisfy and walks on; it never blocks the queue at the head.
+  Safe at N=1; at N>1 it starves multi-device jobs, which is what the reservation guard is for.
 - No new dependency without asking.
 
 ## Testing

@@ -19,9 +19,10 @@ test *ARGS:
 # test_concurrency.py catch the bug they were written for (§7.5).
 #   TSS_CLAIM_IMPL=naive_cleanup just test-naive   # the release-on-failure variant
 test-naive *ARGS:
-    @echo "--- running against the NAIVE claim + reap: failures here are the expected result ---"
+    @echo "--- running against the NAIVE claim/reap/scheduler: failures here are expected ---"
     -TSS_CLAIM_IMPL="${TSS_CLAIM_IMPL:-naive}" {{py}} -m pytest tests/test_allocation.py tests/test_concurrency.py {{ARGS}}
     -TSS_REAP_IMPL=naive {{py}} -m pytest tests/test_fanout.py {{ARGS}}
+    -TSS_SCHEDULER_IMPL=naive {{py}} -m pytest tests/test_scheduler.py {{ARGS}}
 
 lint:
     {{py}} -m ruff check .

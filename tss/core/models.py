@@ -73,11 +73,21 @@ TERMINAL_JOB_STATES: frozenset[JobState] = frozenset(
 
 
 class Outcome(StrEnum):
+    """Whose problem is it? `JobState` says what happened; this says who owns it.
+
+    Deliberately NOT a copy of `JobState`: there is no `dead_letter` here. A
+    dead-lettered job is `state='dead_letter'`, `outcome='infra_error'` — it only
+    ever gets there down the infra retry path, since FAILED is a real result and
+    never retries (§4.2). Repeating the state in the outcome would discard the
+    one distinction the data model exists to preserve, on the jobs that failed
+    worst: a dashboard counting `infra_error` would silently exclude the most
+    severe infra failures in the fleet.
+    """
+
     PASSED = "passed"
     FAILED = "failed"  # the firmware misbehaved — the engineer's problem
     INFRA_ERROR = "infra_error"  # the rig misbehaved — our problem (§4.3)
     CANCELLED = "cancelled"
-    DEAD_LETTER = "dead_letter"
 
 
 #: One entry per device a job needs. A spec matches a resource if the resource's

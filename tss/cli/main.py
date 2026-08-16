@@ -1,9 +1,9 @@
 """`tss` — the one-shot CLI (§3.9).
 
     tss fleet     benches with their devices nested underneath
+    tss queue     what is running and what is waiting
 
-`tss queue`, `tss why`, `tss watch` and the operator verbs arrive with the
-scheduler and the TUI in later steps.
+`tss why`, `tss watch` and the operator verbs arrive with the TUI in later steps.
 """
 
 from __future__ import annotations
@@ -87,16 +87,79 @@ def render_fleet(fleet: dict, console: Console, *, show_all: bool = False) -> No
         console.print("[dim]no benches registered — start one with `just agent`[/dim]")
 
 
-def cmd_fleet(args: argparse.Namespace) -> int:
-    console = Console()
+def render_queue(queue: dict, console: Console) -> None:
+    """Queued and running jobs (§3.9).
+
+    Elapsed-versus-budget, never an estimated start time: a confident "starts in
+    ~3m" is a lie without historical durations, which the POC does not collect.
+    """
+    running = Table(box=None, pad_edge=False, header_style="bold", title_justify="left")
+    running.add_column("JOB")
+    running.add_column("NAME")
+    running.add_column("STATE")
+    running.add_column("BENCH")
+    running.add_column("DEVICES")
+    running.add_column("ELAPSED", justify="right")
+    for job in queue["running"]:
+        elapsed = job["elapsed_s"]
+        running.add_row(
+            job["job_id"],
+            job["name"],
+            Text(job["state"].upper(), style="yellow" if job["state"] == "running" else "cyan"),
+            job["agent_id"] or "—",
+            " · ".join(r.split(":", 1)[-1] for r in job["resource_ids"]) or "—",
+            "—" if elapsed is None else f"{elapsed:.0f}s / {job['max_duration_s']}s",
+        )
+
+    queued = Table(box=None, pad_edge=False, header_style="bold")
+    queued.add_column("JOB")
+    queued.add_column("NAME")
+    queued.add_column("NEEDS")
+    queued.add_column("WAITED", justify="right")
+    queued.add_column("WHY", overflow="fold")
+    for job in queue["queued"]:
+        needs = " + ".join(
+            ",".join(f"{k}={v}" for k, v in spec.items()) for spec in job["requirements"]
+        )
+        why = job["blocked_reason"] or ""
+        if job["attempt"]:
+            why = (
+                why + f" retry {job['attempt']}, tried {len(job['tried_agents'])} bench(es)"
+            ).strip()
+        queued.add_row(job["job_id"], job["name"], needs, f"{job['waited_s']:.0f}s", why)
+
+    console.print(f"[bold]RUNNING[/bold] ({len(queue['running'])})")
+    console.print(running if queue["running"] else Text("  nothing running", style="dim"))
+    console.print(f"\n[bold]QUEUED[/bold] ({len(queue['queued'])})")
+    console.print(queued if queue["queued"] else Text("  queue empty", style="dim"))
+
+
+def _get(args: argparse.Namespace, path: str, console: Console) -> dict | None:
     try:
-        response = httpx.get(f"{args.url.rstrip('/')}/v1/fleet", timeout=10.0)
+        response = httpx.get(f"{args.url.rstrip('/')}{path}", timeout=10.0)
         response.raise_for_status()
     except httpx.HTTPError as exc:
         console.print(f"[red]cannot reach TSS at {args.url}[/red] ({exc.__class__.__name__})")
         console.print("[dim]is `just serve` running?[/dim]")
+        return None
+    return response.json()
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    console = Console()
+    queue = _get(args, "/v1/queue", console)
+    if queue is None:
         return 1
-    render_fleet(response.json(), console, show_all=args.all)
+    render_queue(queue, console)
+    return 0
+
+
+def cmd_fleet(args: argparse.Namespace) -> int:
+    console = Console()
+    fleet = _get(args, "/v1/fleet", console)
+    if fleet is None:
+        return 1
+    render_fleet(fleet, console, show_all=args.all)
     return 0
 
 
@@ -111,9 +174,13 @@ def main(argv: list[str] | None = None) -> int:
         help="include retired devices (gone from the bench, kept for history)",
     )
 
+    sub.add_parser("queue", help="queued and running jobs")
+
     args = parser.parse_args(argv)
     if args.command == "fleet":
         return cmd_fleet(args)
+    if args.command == "queue":
+        return cmd_queue(args)
     parser.error(f"unknown command {args.command}")
     return 2
 

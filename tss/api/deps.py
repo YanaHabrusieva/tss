@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import Request
 
 from tss.core.config import Config
+from tss.core.scheduler import Scheduler
 from tss.core.store import Store
 
 
@@ -14,3 +15,7 @@ def get_store(request: Request) -> Store:
 
 def get_config(request: Request) -> Config:
     return request.app.state.config
+
+
+def get_scheduler(request: Request) -> Scheduler:
+    return request.app.state.scheduler

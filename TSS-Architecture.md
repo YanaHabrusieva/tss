@@ -321,7 +321,18 @@ goes to which job, then ask the store to commit it. It performs no writes itself
 4. Among agents that can satisfy the whole job, prefer the one whose matched resources have the
    oldest `last_assigned_at` (**LRU**).
 5. Attempt the N-way claim. On any rowcount-0 or `SQLITE_BUSY`, roll back and try the next agent.
-6. Stop when the queue empties or no agent can satisfy the head of the queue.
+6. **Skip** a job no agent can currently satisfy and carry on down the queue. Stop only when the
+   queue is exhausted.
+
+**Skip, do not stop at the head.** Blocking the whole queue behind an unsatisfiable job idles a bench
+that has a free compatible device while a matching job waits — the exact thing §1.2 exists to prevent.
+At N=1 skipping cannot starve anyone: a job is only skipped when *no* free device matches it, so
+nothing is overtaking it for hardware it could have used.
+
+> **But skipping is precisely what starves multi-device jobs at N>1**, where a job needing three
+> devices is passed over indefinitely while single-device jobs consume capacity the moment it frees.
+> That is why §3.4.1 exists. The pairing is not optional: **skip + no reservation = starvation**, and
+> the reservation logic is what makes skipping safe once jobs need more than one device.
 
 **Capability matching is a subset test, per resource.** A requirement spec matches a resource if the
 resource satisfies every key in the spec:
@@ -854,6 +865,13 @@ single counter cannot tell "this job is poison" from "these three benches are br
 it means three infra failures dead-letter a healthy job while §3.5's table promises presence-expiry
 requeue "always."
 
+**`state` and `outcome` answer different questions — do not let one repeat the other.** `state` says
+*what happened to the job*; `outcome` says *whose problem it is*. A dead-lettered job is
+`state='dead_letter'`, `outcome='infra_error'` — never `outcome='dead_letter'`, which throws away the
+one distinction the whole data model exists to preserve. Dead letters are the *worst* infra failures;
+a dashboard counting `outcome='infra_error'` that silently excludes them is reporting the opposite of
+the truth. `dead_letter` therefore belongs in the `state` enum only.
+
 **`DEAD_LETTER` / poison jobs.** A job that crashes every bench it touches will walk the fleet
 quarantining machines one at a time until nothing is left. After `MAX_DISTINCT_AGENTS` (3), stop: mark
 it `DEAD_LETTER`, and **do not count those failures against the agents**. Distinguishing "this job is
@@ -913,7 +931,7 @@ CREATE TABLE jobs (
     finished_at    REAL,
     blocked_reason TEXT,                       -- 'no_capable_agent' — surfaced by `tss why`
     outcome        TEXT CHECK (outcome IS NULL OR outcome IN
-                     ('passed','failed','infra_error','cancelled','dead_letter')),
+                     ('passed','failed','infra_error','cancelled')),
     result_detail  TEXT                        -- 'timeout', 'agent_lost', 'no_capable_agent'
 );
 CREATE INDEX idx_jobs_queue   ON jobs(state, priority, submitted_at);
@@ -1398,4 +1416,16 @@ leave idle.
    Worth a flag eventually; out of scope now.
 5. **Artifact handling.** Real HIL tests produce logs, traces, firmware dumps. Out of scope, and the
    strongest *"what's next"* answer for the customer section.
+6. **Schema migrations and history retention.** Deliberately not built: the schema is guarded by
+   `PRAGMA user_version` and refuses to open a stale file, so the failure is loud rather than silent,
+   and the fix during development is to delete the database. That is affordable *because the
+   operational state is self-healing* — presence leases expire on their own after a restart (§7.2),
+   and the fleet reconstitutes within one heartbeat because agents push their own inventory (§3.1).
+   TSS never held that data authoritatively; the benches did. **What is genuinely lost is the audit
+   trail** — `events` and `job_resources`, which are what answer "why did my job move to another bench
+   last Tuesday." Migrations become necessary at the point where two things are both true: someone
+   queries history for something that matters (flaky-device detection, bench reliability scoring), and
+   you can no longer afford to delete the database in order to deploy. Both arrive with the
+   fleet-health work in §9. *Recommendation: name this trade explicitly rather than presenting the
+   absence of migrations as an oversight — the reasoning is the answer.*
 6. **Historical duration estimates.** Needed before `tss why` can honestly show an ETA (§3.9).

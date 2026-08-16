@@ -31,6 +31,7 @@ from tss.core.models import (
     Agent,
     AgentState,
     AgentView,
+    Assignment,
     CapabilitySpec,
     ClaimResult,
     Event,
@@ -38,6 +39,7 @@ from tss.core.models import (
     InventoryItem,
     Job,
     JobState,
+    Outcome,
     PresenceStatus,
     ReapResult,
     Registration,
@@ -56,6 +58,26 @@ REASON_UNKNOWN_JOB = "unknown_job"
 REASON_DB_BUSY = "db_busy"
 
 _BUSY_ERRCODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
+
+#: Bump on ANY change to SCHEMA_SQL. Stamped into `PRAGMA user_version` when a
+#: database is created and checked when one is opened.
+#:
+#:   1  pre-guard: unstamped, and `outcome` still accepted 'dead_letter'
+#:   2  'dead_letter' removed from the outcome CHECK — it is a state, not an
+#:      outcome, and a dead letter's outcome is 'infra_error'
+#:
+#: This is NOT a migration system and is not trying to be one; migrations are out
+#: of scope for the POC. It exists because the failure it prevents is silent:
+#: `CREATE TABLE IF NOT EXISTS` leaves an older database's constraints exactly as
+#: they were, so a stale file goes on cheerfully accepting writes this build
+#: forbids, and the first sign of trouble is a report that quietly disagrees with
+#: the code. Refusing to open is loud, immediate, and one `rm` from fixed.
+SCHEMA_VERSION = 2
+
+
+class SchemaVersionError(RuntimeError):
+    """The database on disk was written by a different schema than this build."""
+
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -108,7 +130,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at    REAL,
     blocked_reason TEXT,                       -- 'no_capable_agent' — surfaced by `tss why`
     outcome        TEXT CHECK (outcome IS NULL OR outcome IN
-                     ('passed','failed','infra_error','cancelled','dead_letter')),
+                     ('passed','failed','infra_error','cancelled')),
+                                               -- no 'dead_letter': that is a STATE.
+                                               -- A dead letter's outcome is infra_error.
     result_detail  TEXT                        -- 'timeout', 'agent_lost', 'no_capable_agent'
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_queue   ON jobs(state, priority, submitted_at);
@@ -193,11 +217,44 @@ class Store:
             conn.execute(f"PRAGMA busy_timeout = {self.config.busy_timeout_ms}")
             conn.execute("PRAGMA foreign_keys = ON")  # otherwise the FKs are decorative
             conn.execute("PRAGMA synchronous = NORMAL")  # safe under WAL
+            try:
+                self._check_schema_version(conn)
+            except BaseException:
+                conn.close()
+                raise
             self._local.conn = conn
         return conn
 
+    def _check_schema_version(self, conn: sqlite3.Connection) -> None:
+        """Refuse to touch a database this build did not write (SCHEMA_VERSION).
+
+        An unstamped file with tables in it is a database from before the guard
+        existed, which is exactly the stale case worth catching. An unstamped
+        file with no tables is simply new — `init_schema` will stamp it.
+        """
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version == SCHEMA_VERSION:
+            return
+        created = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
+        ).fetchone()
+        if version == 0 and created is None:
+            return  # fresh database
+        raise SchemaVersionError(
+            f"{self.path} has schema version {version}, but this build expects "
+            f"{SCHEMA_VERSION}. TSS has no migrations — that is deliberate for the "
+            f"POC, and refusing to open is the point: an older file keeps its old "
+            f"CHECK constraints and would silently accept writes this build "
+            f"forbids. Delete it and let it be recreated:\n"
+            f"    rm -f {self.path} {self.path}-wal {self.path}-shm"
+        )
+
     def init_schema(self) -> None:
-        self.conn.executescript(SCHEMA_SQL)
+        conn = self.conn  # runs the version guard first
+        conn.executescript(SCHEMA_SQL)
+        # Stamped last, so a half-created database stays unstamped rather than
+        # claiming to be a version it never finished becoming.
+        conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
 
     def close(self) -> None:
         """Close this thread's connection. Each thread closes its own."""
@@ -578,6 +635,152 @@ class Store:
                 self.append_event(kind, agent_id=agent_id, resource_id=resource_id, now=now)
         return changed
 
+    # --------------------------------------------------- dispatch and results
+    def pending_assignment(self, agent_id: str) -> Assignment | None:
+        """The oldest job claimed for this agent that it has not started yet.
+
+        Re-delivered on every heartbeat until the agent calls /start, which is
+        what recovers an assignment lost in flight. The agent ignores a job it is
+        already running, and /start is fenced by the epoch, so a duplicate
+        delivery is harmless (§13.1).
+        """
+        row = self.conn.execute(
+            """SELECT * FROM jobs
+                WHERE agent_id = ? AND state = 'assigned'
+                ORDER BY assigned_at, id LIMIT 1""",
+            (agent_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        job = Job.from_row(row)
+        return Assignment(
+            job_id=job.id,
+            epoch=job.epoch,
+            agent_id=agent_id,
+            # The bench knows its devices by their local names (§6).
+            resource_ids=[local_of(r) for r in self.resources_held_by(job.id)],
+            payload=job.payload,
+            max_duration_s=job.max_duration_s,
+        )
+
+    def start_job(self, job_id: str, agent_id: str, epoch: int, *, now: float | None = None) -> str:
+        """The agent says it has begun. Returns 'started' or a rejection reason.
+
+        Fenced: the epoch and the agent must both match, and the job must still
+        be `assigned`. An agent that was reaped and is only now getting round to
+        starting the job must not move a job someone else owns.
+        """
+        now = time.time() if now is None else now
+        cur = self.conn.execute(
+            """UPDATE jobs SET state = 'running', started_at = :now
+                WHERE id = :job_id AND agent_id = :agent_id AND epoch = :epoch
+                  AND state = 'assigned'""",
+            {"now": now, "job_id": job_id, "agent_id": agent_id, "epoch": epoch},
+        )
+        if cur.rowcount == 1:
+            self.append_event("job.started", agent_id=agent_id, job_id=job_id, now=now)
+            return "started"
+        return self._diagnose_fence(job_id, agent_id, epoch)
+
+    def complete_job(
+        self,
+        job_id: str,
+        agent_id: str,
+        epoch: int,
+        outcome: Outcome,
+        *,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> str:
+        """Record a result and release the hardware — one transaction (§6).
+
+        EVERY resource the job holds is freed by a single statement keyed on
+        `current_job_id`, so a release cannot free some of a job's devices and
+        leave the rest held. That is I8's other half: the `resource_count = :n`
+        guard covers claim time, and this covers release time.
+
+        `infra_error` is not a result. The rig broke, not the firmware, so the
+        job goes back to the queue (or dead-letters after MAX_DISTINCT_AGENTS
+        benches) rather than being reported to the engineer as a failure (§4.3).
+        """
+        now = time.time() if now is None else now
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                """SELECT state FROM jobs
+                    WHERE id = :job_id AND agent_id = :agent_id AND epoch = :epoch
+                      AND state IN ('assigned','running')""",
+                {"job_id": job_id, "agent_id": agent_id, "epoch": epoch},
+            ).fetchone()
+            if row is None:
+                self._rollback(conn)
+                return self._diagnose_fence(job_id, agent_id, epoch)
+
+            if outcome is Outcome.INFRA_ERROR:
+                kind = self._requeue_job(
+                    conn,
+                    job_id,
+                    agent_id=agent_id,
+                    now=now,
+                    reason=f"infra_error:{detail}" if detail else "infra_error",
+                )
+                accepted = "requeued" if kind == "job.requeued" else "dead_lettered"
+            else:
+                conn.execute(
+                    """UPDATE jobs
+                          SET state = :state, outcome = :outcome, result_detail = :detail,
+                              finished_at = :now, epoch = epoch + 1
+                        WHERE id = :job_id AND epoch = :epoch
+                          AND state IN ('assigned','running')""",
+                    {
+                        "state": str(outcome),
+                        "outcome": str(outcome),
+                        "detail": detail,
+                        "now": now,
+                        "job_id": job_id,
+                        "epoch": epoch,
+                    },
+                )
+                conn.execute(
+                    """UPDATE job_resources SET released_at = :now
+                        WHERE job_id = :job_id AND epoch = :epoch AND released_at IS NULL""",
+                    {"now": now, "job_id": job_id, "epoch": epoch},
+                )
+                self._insert_event(
+                    conn,
+                    kind="job.completed",
+                    ts=now,
+                    agent_id=agent_id,
+                    job_id=job_id,
+                    detail={"outcome": str(outcome), "detail": detail, "epoch": epoch},
+                )
+                accepted = "accepted"
+
+            # Every device this job holds, in one statement. Not a loop.
+            conn.execute(
+                """UPDATE resources SET state = 'free', current_job_id = NULL
+                    WHERE current_job_id = :job_id AND state = 'busy'""",
+                {"job_id": job_id},
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            self._rollback(conn)
+            raise
+        return accepted
+
+    def _diagnose_fence(self, job_id: str, agent_id: str, epoch: int) -> str:
+        """Why a fenced write matched nothing. Everything here means the same
+        thing to the agent: you do not own this job any more, abandon it."""
+        job = self.get_job(job_id)
+        if job is None:
+            return "unknown_job"
+        if job.epoch != epoch or job.agent_id != agent_id:
+            return "stale_epoch"
+        if job.is_terminal:
+            return "already_terminal"
+        return "wrong_state"
+
     # ------------------------------------------------------------- the reaper
     def expired_agents(self, *, now: float | None = None) -> list[str]:
         """Sweep 1's query (§3.5). A lease has no opinion: time passes, it expires.
@@ -730,9 +933,17 @@ class Store:
         # three benches are broken".
         benches_tried = len(set(json.loads(row["tried_agents"])))
         if benches_tried >= self.config.max_distinct_agents:
+            # `state` says what happened; `outcome` says whose problem it is.
+            # Dead-lettering only ever happens on the infra retry path — FAILED
+            # is a real result and never retries (§4.2) — so the outcome is
+            # always `infra_error`, and the specifics go in result_detail.
+            # Writing outcome='dead_letter' would repeat the state and throw away
+            # the FAILED-vs-INFRA_ERROR distinction on the jobs that failed
+            # worst: a dashboard counting infra_error would silently exclude the
+            # most severe infra failures in the fleet.
             sql = """UPDATE jobs
-                        SET state = 'dead_letter', outcome = 'dead_letter',
-                            result_detail = :reason, agent_id = NULL,
+                        SET state = 'dead_letter', outcome = 'infra_error',
+                            result_detail = :detail, agent_id = NULL,
                             epoch = epoch + 1, finished_at = :now
                       WHERE id = :job_id AND state IN ('assigned','running')"""
             kind = "job.dead_letter"
@@ -743,7 +954,9 @@ class Store:
                       WHERE id = :job_id AND state IN ('assigned','running')"""
             kind = "job.requeued"
 
-        if conn.execute(sql, {"job_id": job_id, "now": now, "reason": reason}).rowcount != 1:
+        detail = f"{reason} after {benches_tried} benches"
+        params = {"job_id": job_id, "now": now, "reason": reason, "detail": detail}
+        if conn.execute(sql, params).rowcount != 1:
             return None
         self._insert_event(
             conn,
@@ -890,6 +1103,9 @@ class Store:
         row = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return Job.from_row(row) if row else None
 
+    def agents(self) -> list[Agent]:
+        return [Agent.from_row(r) for r in self.conn.execute("SELECT * FROM agents ORDER BY id")]
+
     def list_resources(self, agent_id: str | None = None) -> list[Resource]:
         if agent_id is None:
             rows = self.conn.execute("SELECT * FROM resources ORDER BY id").fetchall()
@@ -917,6 +1133,60 @@ class Store:
             params = (job_id,)
         sql += " ORDER BY job_id, resource_id, epoch"
         return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    def queued_jobs(self, *, limit: int | None = None) -> list[Job]:
+        """The queue, oldest-first within priority (§5's idx_jobs_queue)."""
+        sql = "SELECT * FROM jobs WHERE state = 'queued' ORDER BY priority, submitted_at, id"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        return [Job.from_row(r) for r in self.conn.execute(sql)]
+
+    def jobs_in_flight(self) -> list[Job]:
+        """Everything not yet terminal: queued, assigned and running."""
+        return [
+            Job.from_row(r)
+            for r in self.conn.execute(
+                """SELECT * FROM jobs
+                    WHERE state IN ('queued','assigned','running')
+                    ORDER BY priority, submitted_at, id"""
+            )
+        ]
+
+    def queue_position(self, job_id: str) -> int:
+        """1-based position among queued jobs; 0 once it is no longer queued."""
+        row = self.conn.execute(
+            """SELECT COUNT(*) AS ahead FROM jobs
+                WHERE state = 'queued'
+                  AND (priority, submitted_at, id) <= (
+                        SELECT priority, submitted_at, id FROM jobs WHERE id = ?)""",
+            (job_id,),
+        ).fetchone()
+        return int(row["ahead"])
+
+    def online_agents(self, *, now: float | None = None) -> list[Agent]:
+        """Benches that may be offered work: online, lease still valid.
+
+        `draining` and `quarantined` are deliberately excluded — one is finishing
+        up before a deploy, the other is suspect. And an agent whose lease has run
+        out but which the reaper has not swept yet is not offered work either:
+        it is about to be taken apart.
+        """
+        now = time.time() if now is None else now
+        rows = self.conn.execute(
+            """SELECT * FROM agents
+                WHERE state = 'online' AND presence_expires_at > ?
+                ORDER BY id""",
+            (now,),
+        ).fetchall()
+        return [Agent.from_row(r) for r in rows]
+
+    def has_free_resources(self, agent_id: str) -> bool:
+        """Spare capacity — which is what decides whether a heartbeat long-polls."""
+        row = self.conn.execute(
+            "SELECT 1 FROM resources WHERE agent_id = ? AND state = 'free' LIMIT 1",
+            (agent_id,),
+        ).fetchone()
+        return row is not None
 
     def fleet(self, *, now: float | None = None) -> FleetView:
         """The two-level fleet view (§3.9): benches, each with its devices.

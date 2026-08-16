@@ -31,6 +31,9 @@ packages = ["tss"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+# No test classes in this suite; without this, pytest tries to collect helper
+# classes whose names start with "Test" (TestbedAgent) and warns.
+python_classes = []
 markers = [
     "concurrency: threaded races against real SQLite connections",
 ]

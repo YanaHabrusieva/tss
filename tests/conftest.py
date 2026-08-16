@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 
 import pytest
 
@@ -112,13 +113,27 @@ FAST_CONFIG = Config(
 )
 
 
-@pytest.fixture
-def live_server(db_path: str):
+#: Dispatch-latency config. The long-poll and the backstop tick are deliberately
+#: LONG: if the scheduler's wakeup or the per-agent wakeup were broken, dispatch
+#: would fall back to one of those and take seconds. A sub-second assertion is
+#: only meaningful when the slow paths are slow.
+DISPATCH_CONFIG = Config(
+    heartbeat_interval_s=0.5,
+    presence_ttl_s=12.0,
+    reaper_interval_s=2.0,
+    longpoll_timeout_s=8.0,
+    scheduler_tick_s=30.0,
+)
+
+
+@contextmanager
+def running_server(db_path: str, config: Config):
     """A real uvicorn on a real socket, on an ephemeral port.
 
     CLAUDE.md: integration tests go over real HTTP, never a mocked transport —
     mocked tests pass while the real thing deadlocks. This costs about a second
-    of startup and is the only way the 404/410 handshake means anything.
+    of startup and is the only way the 404/410 handshake, the long-poll and the
+    epoch fencing mean anything.
     """
     import threading
 
@@ -126,8 +141,8 @@ def live_server(db_path: str):
 
     from tss.api.app import create_app
 
-    store = Store(db_path, FAST_CONFIG)
-    app = create_app(FAST_CONFIG, store)
+    store = Store(db_path, config)
+    app = create_app(config, store)
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="on")
     )
@@ -142,10 +157,24 @@ def live_server(db_path: str):
     port = server.servers[0].sockets[0].getsockname()[1]
 
     try:
-        yield f"http://127.0.0.1:{port}", FAST_CONFIG
+        yield f"http://127.0.0.1:{port}", config
     finally:
         server.should_exit = True
         thread.join(timeout=15)
+
+
+@pytest.fixture
+def live_server(db_path: str):
+    """Short-lease server, for presence and reaping."""
+    with running_server(db_path, FAST_CONFIG) as running:
+        yield running
+
+
+@pytest.fixture
+def dispatch_server(db_path: str):
+    """Normal leases, slow fallbacks — for dispatch and completion."""
+    with running_server(db_path, DISPATCH_CONFIG) as running:
+        yield running
 
 
 #: What a Vehicle Gateway on a heavy-duty harness looks like to the matcher.

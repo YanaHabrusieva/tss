@@ -7,21 +7,25 @@ agent always opens the connection outbound, which works through NAT with no
 network engineering at all. It also means readiness is self-reported: a bench
 only asks for work when it is genuinely ready.
 
-Step 2 scope: presence only. There is no scheduler yet, so the heartbeat response
-carries no assignment and the daemon runs nothing. Job execution lands in step 3.
+The loop: register, heartbeat, and run whatever comes back. Each assignment gets
+its own task, so a bench with three free devices runs three jobs side by side —
+the agent has capacity, not a busy flag (§1.2). Execution itself is simulated
+(§1.4); see executor.py.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import json
 import logging
 import socket
 import sys
+import time
 
 import httpx
+
+from tss.agent.executor import execute
 
 log = logging.getLogger("tss.agent")
 
@@ -48,7 +52,14 @@ class TestbedAgent:
         # Server-supplied; the agent does not get to pick its own heartbeat rate.
         self.heartbeat_interval_s = 3.0
         self.presence_ttl_s = 12.0
+        self.longpoll_timeout_s = 8.0
         self.registered = False
+        #: job_id -> epoch, for the jobs this bench believes it owns.
+        self.running: dict[str, int] = {}
+        self._tasks: dict[str, asyncio.Task] = {}
+        #: Set when a job ends: a device just freed, so ask for work now rather
+        #: than sitting out the rest of the heartbeat interval.
+        self._nudge = asyncio.Event()
 
     async def register(self, client: httpx.AsyncClient) -> None:
         response = await client.post(
@@ -64,6 +75,7 @@ class TestbedAgent:
         body = response.json()
         self.heartbeat_interval_s = body["heartbeat_interval_s"]
         self.presence_ttl_s = body["presence_ttl_s"]
+        self.longpoll_timeout_s = body.get("longpoll_timeout_s", 8.0)
         self.registered = True
         log.info(
             "registered %s with %d device(s): %s",
@@ -72,11 +84,23 @@ class TestbedAgent:
             ", ".join(d["id"] for d in self.inventory),
         )
 
-    async def heartbeat(self, client: httpx.AsyncClient) -> str:
-        """One beat. Returns what happened, for the caller's loop and for tests."""
+    async def heartbeat(self, client: httpx.AsyncClient) -> dict | None:
+        """One beat. Returns the response body, or None if we had to re-register.
+
+        This call may block server-side for up to LONGPOLL_TIMEOUT while the
+        bench has spare capacity — that is the point, and it is why dispatch is
+        sub-second instead of one heartbeat interval.
+        """
         response = await client.post(
             f"{self.base_url}/v1/agents/{self.agent_id}/heartbeat",
-            json={"running_jobs": [], "resource_health": {}},
+            json={
+                # Every job we believe we own, so TSS can fence each one (§6).
+                "running_jobs": [
+                    {"job_id": job_id, "epoch": epoch} for job_id, epoch in self.running.items()
+                ],
+                "resource_health": {},
+            },
+            timeout=self.longpoll_timeout_s + 10,
         )
         if response.status_code in (404, 410):
             # 404 unknown_agent / 410 presence_expired. Both mean the same thing
@@ -85,27 +109,102 @@ class TestbedAgent:
             reason = response.json().get("error", response.status_code)
             log.warning("%s -> re-registering", reason)
             self.registered = False
+            self.running.clear()
+            self._tasks.clear()
             await self.register(client)
-            return str(reason)
+            return None
         response.raise_for_status()
-        return "ok"
+        return response.json()
+
+    async def _run_job(self, client: httpx.AsyncClient, assignment: dict) -> None:
+        """/start -> execute -> /complete. One task per job, so a bench with
+        several free devices genuinely runs several jobs at once (§1.2)."""
+        job_id, epoch = assignment["job_id"], assignment["epoch"]
+        body = {"agent_id": self.agent_id, "epoch": epoch}
+        try:
+            started = await client.post(f"{self.base_url}/v1/jobs/{job_id}/start", json=body)
+            if started.status_code != 200:
+                # Fenced out before we even began — someone else owns this now.
+                log.warning("start %s rejected (%s); abandoning", job_id, started.status_code)
+                return
+            result = await execute(job_id, assignment["resource_ids"], assignment["payload"])
+            done = await client.post(
+                f"{self.base_url}/v1/jobs/{job_id}/complete",
+                json={
+                    **body,
+                    "outcome": result.outcome,
+                    "detail": result.detail,
+                    "duration_s": result.duration_s,
+                },
+            )
+            if done.status_code == 409:
+                # The zombie case: our lease died while we were running. Release
+                # the hardware locally and drop the result on the floor.
+                log.warning("complete %s fenced out (stale epoch); abandoning", job_id)
+        except httpx.HTTPError as exc:
+            log.warning("reporting %s failed (%s)", job_id, exc.__class__.__name__)
+        finally:
+            self.running.pop(job_id, None)
+            self._tasks.pop(job_id, None)
+            self._nudge.set()
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
         stop = stop or asyncio.Event()
         async with httpx.AsyncClient(timeout=30.0) as client:
             while not stop.is_set():
+                began = time.monotonic()  # in-process duration only (§3.3)
                 try:
                     if not self.registered:
                         await self.register(client)
+                        continue  # start polling for work now, not one beat from now
                     else:
-                        await self.heartbeat(client)
+                        body = await self.heartbeat(client)
+                        assignment = (body or {}).get("assignment")
+                        if assignment and assignment["job_id"] not in self.running:
+                            job_id = assignment["job_id"]
+                            self.running[job_id] = assignment["epoch"]
+                            self._tasks[job_id] = asyncio.create_task(
+                                self._run_job(client, assignment)
+                            )
+                            continue  # more capacity may be waiting — ask again now
                 except httpx.HTTPError as exc:
                     # A flaky link is expected and survivable: presence TTL is 4
                     # beats precisely so a few losses do not look like death.
                     log.warning("heartbeat failed (%s); retrying", exc.__class__.__name__)
-                    self.registered = self.registered and True
-                with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=self.heartbeat_interval_s)
+
+                # One beat per interval, no matter how long the poll blocked for.
+                elapsed = time.monotonic() - began
+                await self._wait_for_next_beat(stop, self.heartbeat_interval_s - elapsed)
+
+            for task in list(self._tasks.values()):
+                task.cancel()
+
+    async def _wait_for_next_beat(self, stop: asyncio.Event, timeout: float) -> None:
+        """Sit out the rest of the heartbeat interval — unless a job just ended.
+
+        A finished job has freed a device on this bench, and TSS may already have
+        assigned the next one. Waiting out the remaining interval before asking
+        would put a heartbeat's worth of dead air between "device freed" and
+        "agent has job", which is the number §1.3 puts a sub-second budget on. So
+        the nudge cuts the wait short; the interval itself is what stops a bench
+        at full capacity from spinning.
+        """
+        if timeout <= 0:
+            self._nudge.clear()
+            return
+        waiters = [
+            asyncio.create_task(stop.wait()),
+            asyncio.create_task(self._nudge.wait()),
+        ]
+        try:
+            _done, pending = await asyncio.wait(
+                waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+        finally:
+            # Cleared before the next heartbeat reads state, never after.
+            self._nudge.clear()
 
 
 def build_inventory(count: int, product: str, harness: str | None) -> list[dict]:

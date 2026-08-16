@@ -18,17 +18,21 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from tss.api.deps import get_config, get_store
+from tss.api.deps import get_config, get_scheduler, get_store
 from tss.core.config import Config
-from tss.core.models import InventoryItem, PresenceStatus
+from tss.core.models import Assignment, InventoryItem, Outcome, PresenceStatus
+from tss.core.scheduler import Scheduler
 from tss.core.store import Store
 
 log = logging.getLogger("tss.api.agent")
 
 router = APIRouter(prefix="/v1/agents", tags=["agent"])
+#: /start and /complete are agent-facing too, despite living under /v1/jobs (§6).
+job_router = APIRouter(prefix="/v1/jobs", tags=["agent"])
 
 StoreDep = Annotated[Store, Depends(get_store)]
 ConfigDep = Annotated[Config, Depends(get_config)]
+SchedulerDep = Annotated[Scheduler, Depends(get_scheduler)]
 
 
 class RegisterRequest(BaseModel):
@@ -62,10 +66,25 @@ class HeartbeatRequest(BaseModel):
 
 
 class HeartbeatResponse(BaseModel):
-    #: Always null until the scheduler exists (step 3), along with the long-poll
-    #: that makes dispatch sub-second. An agent still heartbeats to hold presence.
-    assignment: dict[str, Any] | None = None
+    #: One assignment at a time. A bench with spare capacity heartbeats again
+    #: immediately after taking one, so filling four devices costs four fast
+    #: round-trips rather than four heartbeat intervals.
+    assignment: Assignment | None = None
+    #: `drain` and `cancel_job` arrive with the operator verbs and sweep 2.
     directives: list[Any] = Field(default_factory=list)
+
+
+class StartRequest(BaseModel):
+    agent_id: str
+    epoch: int
+
+
+class CompleteRequest(BaseModel):
+    agent_id: str
+    epoch: int
+    outcome: Outcome
+    detail: str | None = None
+    duration_s: float | None = None
 
 
 @router.post("/register", response_model=RegisterResponse)
@@ -93,13 +112,20 @@ async def register(req: RegisterRequest, store: StoreDep, config: ConfigDep) -> 
 
 
 @router.post("/{agent_id}/heartbeat")
-async def heartbeat(agent_id: str, req: HeartbeatRequest, store: StoreDep):
+async def heartbeat(agent_id: str, req: HeartbeatRequest, store: StoreDep, scheduler: SchedulerDep):
     """The workhorse: renew presence, report device health, collect work.
 
     The 404 and 410 are what make recovery reachable. A reaped agent's row still
     exists, so an unguarded renewal would hand it a cheerful 200 and leave it
     sitting in OFFLINE forever — gone from the fleet and never coming back, which
     is exactly what a bench does after a few dropped beats.
+
+    LONG-POLL (§3.1). An agent with spare capacity blocks here for up to
+    LONGPOLL_TIMEOUT and returns the instant the scheduler assigns it something —
+    one endpoint, one connection per agent, sub-second dispatch. An agent at full
+    capacity gets an immediate reply; it only needs to renew presence. Presence is
+    renewed BEFORE the block, and LONGPOLL_TIMEOUT + HEARTBEAT_INTERVAL <
+    PRESENCE_TTL (§7.1), so an agent's own long-poll can never let its lease lapse.
     """
     status, _agent = store.renew_presence(agent_id)
 
@@ -116,4 +142,45 @@ async def heartbeat(agent_id: str, req: HeartbeatRequest, store: StoreDep):
     if req.resource_health:
         store.report_resource_health(agent_id, req.resource_health)
 
-    return HeartbeatResponse()
+    assignment = store.pending_assignment(agent_id)
+    if assignment is None and store.has_free_resources(agent_id):
+        assignment = await scheduler.wait_for_assignment(agent_id)
+
+    return HeartbeatResponse(assignment=assignment)
+
+
+@job_router.post("/{job_id}/start")
+async def start_job(job_id: str, req: StartRequest, store: StoreDep):
+    """The agent has begun. Fenced by the epoch it was issued (§3.5)."""
+    outcome = store.start_job(job_id, req.agent_id, req.epoch)
+    if outcome != "started":
+        return _fenced_out(outcome, job_id)
+    return {"accepted": True}
+
+
+@job_router.post("/{job_id}/complete")
+async def complete_job(job_id: str, req: CompleteRequest, store: StoreDep, scheduler: SchedulerDep):
+    """The result, and the release of every device the job held.
+
+    THE ZOMBIE (§3.5). An agent that was isolated, had its job requeued, and has
+    now come back reports a result for a run that was abandoned. Its epoch is
+    stale, so it gets a 409 and abandons the job instead of overwriting a result
+    someone else produced. Without this, an engineer ships on a result from a run
+    that TSS had already given up on.
+    """
+    outcome = store.complete_job(job_id, req.agent_id, req.epoch, req.outcome, detail=req.detail)
+    if outcome in ("accepted", "requeued", "dead_lettered"):
+        # Devices came free — the queue should be looked at right now, not on the
+        # next backstop tick.
+        scheduler.notify()
+        return {"accepted": True, "result": outcome}
+    return _fenced_out(outcome, job_id)
+
+
+def _fenced_out(reason: str, job_id: str) -> JSONResponse:
+    if reason == "unknown_job":
+        return JSONResponse(status_code=404, content={"error": "unknown_job", "job_id": job_id})
+    return JSONResponse(
+        status_code=409,
+        content={"error": "stale_epoch", "action": "abandon_job", "job_id": job_id},
+    )

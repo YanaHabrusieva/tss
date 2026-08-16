@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import Callable
 
 from tss.core.config import DEFAULT, Config
 from tss.core.models import ReapResult
@@ -29,9 +30,18 @@ log = logging.getLogger("tss.reaper")
 
 
 class Reaper:
-    def __init__(self, store: Store, config: Config = DEFAULT) -> None:
+    def __init__(
+        self,
+        store: Store,
+        config: Config = DEFAULT,
+        *,
+        on_reap: Callable[[], None] | None = None,
+    ) -> None:
         self.store = store
         self.config = config
+        #: Poke the scheduler (§3.5): a reap frees devices and requeues jobs, and
+        #: the queue should be looked at now rather than on the backstop tick.
+        self.on_reap = on_reap
         self.sweeps = 0  # visible in tests and logs; a stalled reaper is silent otherwise
         self._task: asyncio.Task | None = None
 
@@ -52,6 +62,8 @@ class Reaper:
                 else "",
             )
         self.sweeps += 1
+        if results and self.on_reap is not None:
+            self.on_reap()
         return results
 
     async def run(self) -> None:

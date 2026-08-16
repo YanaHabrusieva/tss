@@ -12,10 +12,12 @@ and the state guard are both missing.
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from tests.conftest import assert_i5, inventory, submit
-from tss.core.models import AgentState, JobState, ResourceState
+from tss.core.models import AgentState, JobState, Outcome, ResourceState
 
 AGENT = "bench-sf-01"
 T0 = 1_000_000.0
@@ -104,9 +106,57 @@ def test_a_job_on_its_last_bench_dead_letters_instead_of_requeueing(store, reap,
                 "3 distinct benches tried — this job is poison"
             )
             assert job.state == JobState.DEAD_LETTER
-            assert job.outcome == "dead_letter"
+            assert job.outcome == Outcome.INFRA_ERROR
 
     assert len(store.get_job("job-poison").tried_agents) == 3
+
+
+def test_a_dead_letter_is_an_infra_error_not_its_own_outcome(store, reap, config):
+    """`state` says what happened; `outcome` says whose problem it is.
+
+    A dead letter is the *worst* kind of infra failure — the job walked three
+    benches and broke on all of them — so `outcome='dead_letter'` would repeat
+    the state and throw away the one distinction the data model exists for, on
+    exactly the jobs that failed worst. It is never the engineer's problem:
+    dead-lettering only happens on the infra retry path, because FAILED is a real
+    result and never retries (§4.2).
+    """
+    submit(store, "job-poison", 1)
+    submit(store, "job-ordinary", 1)
+    for i, bench in enumerate(["bench-a", "bench-b", "bench-c"]):
+        store.register_agent(bench, f"{bench}.local", inventory(1), now=T0 + i)
+        assert store.claim_all("job-poison", bench, [f"{bench}:vg-01"], now=T0 + i).ok
+        reap(store, bench, now=T0 + config.presence_ttl_s + 2 + i)
+
+    job = store.get_job("job-poison")
+    assert job.state == JobState.DEAD_LETTER
+    assert job.outcome == Outcome.INFRA_ERROR
+    assert job.result_detail == "presence_expired after 3 benches", (
+        "the specifics belong in result_detail, not in the outcome"
+    )
+    assert job.finished_at is not None
+
+    # THE ASSERTION THAT WOULD HAVE CAUGHT IT: the reporting query the
+    # distinction exists to serve. Counting infra failures must find the worst
+    # ones, not silently exclude them.
+    infra = store.conn.execute(
+        "SELECT id, state FROM jobs WHERE outcome = 'infra_error' ORDER BY id"
+    ).fetchall()
+    assert [(r["id"], r["state"]) for r in infra] == [("job-poison", "dead_letter")]
+
+    # ...and it is still distinguishable from an ordinary retryable infra error.
+    assert store.get_job("job-ordinary").outcome is None
+    assert [
+        r["id"] for r in store.conn.execute("SELECT id FROM jobs WHERE state='dead_letter'")
+    ] == ["job-poison"]
+
+
+def test_dead_letter_is_not_a_permitted_outcome_at_all(store):
+    """Belt and braces at the schema level: the CHECK constraint no longer
+    accepts it, so no future write can reintroduce the ambiguity."""
+    submit(store, "job-A", 1)
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        store.conn.execute("UPDATE jobs SET outcome = 'dead_letter' WHERE id = 'job-A'")
 
 
 def test_a_terminal_job_is_never_resurrected_by_a_reap(store, reap, loaded_bench, config):

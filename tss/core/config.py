@@ -38,6 +38,11 @@ class Config:
     starvation_threshold_s: float = 60.0
     unsatisfiable_timeout_s: float = 1800.0  # 30 min
 
+    # --- scheduling -----------------------------------------------------------
+    #: Backstop tick. The scheduler is event-driven; this is the safety net that
+    #: bounds a lost wakeup to one second instead of forever (§7.3).
+    scheduler_tick_s: float = 1.0
+
     # --- jobs ----------------------------------------------------------------
     default_max_duration_s: int = 600
 

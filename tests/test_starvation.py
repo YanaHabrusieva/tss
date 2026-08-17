@@ -25,7 +25,7 @@ import time
 
 import pytest
 
-from tests.conftest import inventory
+from tests.conftest import inventory, submit
 from tss.core.invariants import check_all, check_i9
 from tss.core.models import InventoryItem, JobState, Outcome, ResourceState
 from tss.core.scheduler import Scheduler
@@ -50,10 +50,6 @@ def bench(store, agent_id, *, devices=2, caps=None, now=T0):
     ]
     store.register_agent(agent_id, f"{agent_id}.local", items, agent_version="0.1.0", now=now)
     return [f"{agent_id}:{item.id}" for item in items]
-
-
-def submit(store, job_id, n, *, at=T0, caps=None):
-    return store.submit_job(job_id, job_id, [dict(caps or VG)] * n, now=at)
 
 
 def occupy(store, agent_id, resource_ids, *, at=T0):
@@ -90,12 +86,12 @@ def test_a_big_job_eventually_runs_under_a_stream_of_small_ones(store, scheduler
     """
     devices = bench(store, "bench-01", devices=3)
     filler = occupy(store, "bench-01", devices)
-    submit(store, "job-big", 3, at=T0)
+    submit(store, "job-big", 3, now=T0, caps=VG)
 
     now = T0 + STARVED
     for round_number in range(6):
         # A fresh single-device job arrives every round, as fast as devices free.
-        submit(store, f"job-small-{round_number}", 1, at=now)
+        submit(store, f"job-small-{round_number}", 1, now=now, caps=VG)
         if round_number == 0:
             store.complete_job(filler, "bench-01", 1, Outcome.PASSED, now=now)
         tick(scheduler, store, now)
@@ -122,9 +118,9 @@ def test_while_it_reserves_other_benches_keep_flowing(store, scheduler, config):
     reserved_bench = bench(store, "bench-01", devices=2)
     bench(store, "bench-02", devices=2, caps=OBD2)
     occupy(store, "bench-01", reserved_bench[:1])  # one device busy, one free
-    submit(store, "job-big", 2, at=T0)
+    submit(store, "job-big", 2, now=T0, caps=VG)
     for i in range(2):
-        submit(store, f"job-small-{i}", 1, at=T0 + 10, caps=ANY_VG)
+        submit(store, f"job-small-{i}", 1, now=T0 + 10, caps=ANY_VG)
 
     results = tick(scheduler, store, T0 + STARVED)
 
@@ -148,8 +144,8 @@ def test_exactly_one_job_reserves_at_a_time(store, scheduler, config):
     sets is a deadlock you built yourself, in bookkeeping instead of hardware."""
     devices = bench(store, "bench-01", devices=3)
     occupy(store, "bench-01", devices[:2])
-    submit(store, "job-big-a", 3, at=T0)
-    submit(store, "job-big-b", 3, at=T0 + 1)
+    submit(store, "job-big-a", 3, now=T0, caps=VG)
+    submit(store, "job-big-b", 3, now=T0 + 1, caps=VG)
 
     tick(scheduler, store, T0 + STARVED)
 
@@ -167,7 +163,7 @@ def test_the_reservation_follows_the_fleet(store, scheduler, config):
     second = bench(store, "bench-02", devices=2)
     occupy(store, "bench-01", ["bench-01:vg-01"])
     occupy(store, "bench-02", second)
-    submit(store, "job-big", 2, at=T0)
+    submit(store, "job-big", 2, now=T0, caps=VG)
 
     tick(scheduler, store, T0 + STARVED)
     assert scheduler.reservation.agent_id == "bench-01", "closest to satisfying it"
@@ -190,8 +186,8 @@ def test_a_reservation_is_released_on_the_very_next_pass(store, scheduler, confi
     """
     devices = bench(store, "bench-01", devices=2)
     occupy(store, "bench-01", devices[:1])
-    submit(store, "job-big", 2, at=T0)
-    submit(store, "job-small", 1, at=T0 + 1)
+    submit(store, "job-big", 2, now=T0, caps=VG)
+    submit(store, "job-small", 1, now=T0 + 1, caps=VG)
 
     tick(scheduler, store, T0 + STARVED)
     assert scheduler.reservation is not None
@@ -215,8 +211,8 @@ def test_dispatching_the_reserving_job_releases_the_rest(store, scheduler, confi
     the same pass, because the reservation is gone the moment it is not needed."""
     devices = bench(store, "bench-01", devices=4)
     occupy(store, "bench-01", devices[:2])
-    submit(store, "job-big", 3, at=T0)
-    submit(store, "job-small", 1, at=T0 + 1)
+    submit(store, "job-big", 3, now=T0, caps=VG)
+    submit(store, "job-small", 1, now=T0 + 1, caps=VG)
 
     tick(scheduler, store, T0 + STARVED)
     assert scheduler.reservation is not None
@@ -245,7 +241,7 @@ def test_a_job_no_bench_could_ever_run_reserves_nothing(store, scheduler, config
     """
     bench(store, "bench-01", devices=2)
     bench(store, "bench-02", devices=2)
-    submit(store, "job-impossible", 3, at=T0)
+    submit(store, "job-impossible", 3, now=T0, caps=VG)
 
     tick(scheduler, store, T0 + STARVED)
 
@@ -275,8 +271,8 @@ def test_an_impossible_job_at_the_head_does_not_suppress_reservation_behind_it(
     devices = bench(store, "bench-01", devices=2)
     occupy(store, "bench-01", devices[:1])
     # Oldest, and nobody in the fleet has an asset gateway at all.
-    submit(store, "job-impossible", 2, at=T0, caps=AG)
-    submit(store, "job-big", 2, at=T0 + 1)
+    submit(store, "job-impossible", 2, now=T0, caps=AG)
+    submit(store, "job-big", 2, now=T0 + 1, caps=VG)
 
     tick(scheduler, store, T0 + STARVED)
 
@@ -301,8 +297,8 @@ def test_the_impossible_job_dead_letters_on_its_own_clock_while_the_other_still_
     reserving. The two jobs do not share a fate."""
     devices = bench(store, "bench-01", devices=2)
     occupy(store, "bench-01", devices[:1])
-    submit(store, "job-impossible", 2, at=T0, caps=AG)
-    submit(store, "job-big", 2, at=T0 + 1)
+    submit(store, "job-impossible", 2, now=T0, caps=AG)
+    submit(store, "job-big", 2, now=T0 + 1, caps=VG)
     tick(scheduler, store, T0 + STARVED)
 
     tick(scheduler, store, T0 + config.unsatisfiable_timeout_s + 1)
@@ -321,7 +317,7 @@ def test_the_impossible_job_dead_letters_on_its_own_clock_while_the_other_still_
 def test_an_unsatisfiable_job_runs_once_the_fleet_is_repaired(store, scheduler, config):
     """Why it stays queued: a bench gets fixed, un-quarantined, or added."""
     bench(store, "bench-01", devices=2)
-    submit(store, "job-big", 3, at=T0)
+    submit(store, "job-big", 3, now=T0, caps=VG)
     tick(scheduler, store, T0 + STARVED)
     assert store.get_job("job-big").blocked_reason == BLOCKED_NO_CAPABLE_AGENT
 
@@ -336,7 +332,7 @@ def test_an_unsatisfiable_job_runs_once_the_fleet_is_repaired(store, scheduler, 
 
 def test_an_unsatisfiable_job_dead_letters_after_the_timeout(store, scheduler, config):
     bench(store, "bench-01", devices=1)
-    submit(store, "job-impossible", 3, at=T0)
+    submit(store, "job-impossible", 3, now=T0, caps=VG)
 
     tick(scheduler, store, T0 + STARVED)
     assert store.get_job("job-impossible").state == JobState.QUEUED
@@ -355,7 +351,7 @@ def test_an_unhealthy_device_can_make_a_bench_infeasible(store, scheduler, confi
     them broken, cannot satisfy a 3-device job."""
     bench(store, "bench-01", devices=3)
     store.report_resource_health("bench-01", {"vg-03": "unhealthy"}, now=T0)
-    submit(store, "job-big", 3, at=T0)
+    submit(store, "job-big", 3, now=T0, caps=VG)
 
     tick(scheduler, store, T0 + STARVED)
 
@@ -370,12 +366,12 @@ def test_i9_catches_a_reservation_that_took_hardware(store, scheduler, config):
     reservation has turned into the partial hold."""
     devices = bench(store, "bench-01", devices=2)
     occupy(store, "bench-01", devices[:1])
-    submit(store, "job-big", 2, at=T0)
+    submit(store, "job-big", 2, now=T0, caps=VG)
     tick(scheduler, store, T0 + STARVED)
     assert check_i9(scheduler) == []
 
     reserved = next(iter(scheduler.reservation.resource_ids))
-    submit(store, "job-thief", 1, at=T0)
+    submit(store, "job-thief", 1, now=T0, caps=VG)
     store.conn.execute(
         "UPDATE resources SET state = 'busy', current_job_id = 'job-thief' WHERE id = ?",
         (reserved,),
@@ -394,7 +390,7 @@ def test_i9_does_not_cry_wolf_when_the_reserving_job_takes_its_own_set(store, sc
     staleness gets ignored, which costs you every real violation after it."""
     devices = bench(store, "bench-01", devices=2)
     occupy(store, "bench-01", devices[:1])
-    submit(store, "job-big", 2, at=T0)
+    submit(store, "job-big", 2, now=T0, caps=VG)
     tick(scheduler, store, T0 + STARVED)
     reserved = next(iter(scheduler.reservation.resource_ids))
 
@@ -417,7 +413,7 @@ def test_i9_does_not_cry_wolf_when_the_reserving_job_takes_its_own_set(store, sc
 def test_i9_catches_a_reservation_on_a_bench_that_could_never_satisfy_it(store, scheduler, config):
     devices = bench(store, "bench-01", devices=2)
     occupy(store, "bench-01", devices[:1])
-    submit(store, "job-big", 2, at=T0)
+    submit(store, "job-big", 2, now=T0, caps=VG)
     tick(scheduler, store, T0 + STARVED)
 
     # A device is unplugged: the target can no longer ever satisfy the job.
@@ -445,8 +441,8 @@ def test_reserving_by_claiming_deadlocks(store, config):
 
     devices = bench(store, "bench-01", devices=2)
     filler = occupy(store, "bench-01", devices)
-    submit(store, "job-a", 2, at=T0)
-    submit(store, "job-b", 2, at=T0 + 1)
+    submit(store, "job-a", 2, now=T0, caps=VG)
+    submit(store, "job-b", 2, now=T0 + 1, caps=VG)
 
     naive = ClaimingReservationScheduler(store, config)
     now = T0 + STARVED
@@ -486,7 +482,7 @@ def test_the_real_reservation_writes_nothing_to_the_database(store, scheduler, c
     to clean up, and no schema column to migrate."""
     devices = bench(store, "bench-01", devices=2)
     occupy(store, "bench-01", devices[:1])
-    submit(store, "job-big", 2, at=T0)
+    submit(store, "job-big", 2, now=T0, caps=VG)
 
     before = store.conn.execute("SELECT * FROM resources ORDER BY id").fetchall()
     events_before = len(store.events())
@@ -510,7 +506,7 @@ def test_reservation_state_survives_a_pass_with_nothing_queued(store, scheduler,
     stale one pointing at a job that has gone."""
     devices = bench(store, "bench-01", devices=2)
     occupy(store, "bench-01", devices[:1])
-    submit(store, "job-big", 2, at=T0)
+    submit(store, "job-big", 2, now=T0, caps=VG)
     tick(scheduler, store, T0 + STARVED)
     assert scheduler.reservation is not None
 
@@ -531,8 +527,8 @@ def test_timing_the_release_over_a_running_scheduler(store, db_path, config):
     devices = bench(store, "bench-01", devices=2, now=time.time())
     occupy(store, "bench-01", devices[:1], at=time.time())
     started = time.time()
-    submit(store, "job-big", 2, at=started - 3600)  # long since starving
-    submit(store, "job-small", 1, at=started - 3600)
+    submit(store, "job-big", 2, now=started - 3600, caps=VG)  # long since starving
+    submit(store, "job-small", 1, now=started - 3600, caps=VG)
 
     loop_config = dataclasses.replace(config, scheduler_tick_s=3600.0)
     scheduler = Scheduler(store, loop_config)

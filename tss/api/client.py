@@ -395,6 +395,54 @@ def _why_not(agent, job, installed, devices) -> str:
     return "its devices cannot be assigned to these requirements together"
 
 
+@router.post("/agents/{agent_id}/drain")
+async def drain(agent_id: str, store: StoreDep, scheduler: SchedulerDep):
+    """Finish current jobs, accept no more (§4.1).
+
+    Every non-automatic transition needs a control surface, and this is the one
+    deploys need: without it, upgrading an agent means killing running tests.
+    """
+    result = store.drain_agent(agent_id)
+    if result == "unknown_agent":
+        raise HTTPException(status_code=404, detail=f"unknown agent {agent_id}")
+    if result.startswith("not_online"):
+        raise HTTPException(
+            status_code=409, detail=f"{agent_id} is {result.split(':', 1)[1]}, not online"
+        )
+    scheduler.notify()  # its devices are out of the pool now
+    return {"draining": True, "agent_id": agent_id}
+
+
+@router.post("/agents/{agent_id}/unquarantine")
+async def unquarantine_agent(agent_id: str, store: StoreDep, scheduler: SchedulerDep):
+    """Let a machine back in. A state with no way out is a slow fleet-drain
+    dressed up as a health feature (§4.2)."""
+    result = store.unquarantine_agent(agent_id)
+    if result == "unknown_agent":
+        raise HTTPException(status_code=404, detail=f"unknown agent {agent_id}")
+    scheduler.notify()
+    return {"unquarantined": True, "agent_id": agent_id}
+
+
+@router.post("/resources/{resource_id:path}/unquarantine")
+async def unquarantine_resource(resource_id: str, store: StoreDep, scheduler: SchedulerDep):
+    """Let one device back in. One dead J-Link costs you one device, not the
+    bench — and clearing it costs one command, not a re-registration."""
+    result = store.unquarantine_resource(resource_id)
+    if result == "unknown_resource":
+        raise HTTPException(status_code=404, detail=f"unknown resource {resource_id}")
+    if result == "retired":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{resource_id} is retired — it is not on the bench any more. "
+                "Re-register the agent with it attached instead."
+            ),
+        )
+    scheduler.notify()
+    return {"unquarantined": True, "resource_id": resource_id}
+
+
 @router.get("/fleet", response_model=FleetView)
 async def fleet(store: StoreDep) -> FleetView:
     """Benches, each with the devices cabled to it (§3.9) — including benches

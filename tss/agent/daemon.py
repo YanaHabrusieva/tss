@@ -60,6 +60,10 @@ class TestbedAgent:
         #: Set when a job ends: a device just freed, so ask for work now rather
         #: than sitting out the rest of the heartbeat interval.
         self._nudge = asyncio.Event()
+        #: Set when TSS says drain: finish what is running, take nothing new,
+        #: then exit. The operator restarts the daemon after maintenance and it
+        #: re-registers clean (§4.1).
+        self.draining = False
 
     async def register(self, client: httpx.AsyncClient) -> None:
         response = await client.post(
@@ -154,6 +158,13 @@ class TestbedAgent:
         for directive in directives or []:
             if isinstance(directive, dict) and "cancel_job" in directive:
                 self.abandon(directive["cancel_job"], why="cancel_job directive")
+            elif directive == "drain":
+                if not self.draining:
+                    log.warning(
+                        "drain requested — finishing %d job(s), accepting no more",
+                        len(self.running),
+                    )
+                self.draining = True
             else:
                 log.info("ignoring unknown directive %r", directive)
 
@@ -208,8 +219,19 @@ class TestbedAgent:
                     else:
                         body = await self.heartbeat(client)
                         self.handle_directives((body or {}).get("directives", []))
+                        if self.draining and not self.running:
+                            # Everything we were running has reported. Stop
+                            # heartbeating and exit: presence expiry takes it from
+                            # here, with nothing left to requeue. No special
+                            # DRAINING -> OFFLINE path exists, on purpose.
+                            log.info("drained — exiting")
+                            return
                         assignment = (body or {}).get("assignment")
-                        if assignment and assignment["job_id"] not in self.running:
+                        if (
+                            assignment
+                            and not self.draining
+                            and assignment["job_id"] not in self.running
+                        ):
                             job_id = assignment["job_id"]
                             self.running[job_id] = assignment["epoch"]
                             self._tasks[job_id] = asyncio.create_task(

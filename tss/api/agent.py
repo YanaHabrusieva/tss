@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 from tss.api.deps import get_config, get_directives, get_scheduler, get_store
 from tss.core.config import Config
 from tss.core.directives import DirectiveQueue
-from tss.core.models import Assignment, InventoryItem, Outcome, PresenceStatus
+from tss.core.models import AgentState, Assignment, InventoryItem, Outcome, PresenceStatus
 from tss.core.scheduler import Scheduler
 from tss.core.store import Store
 
@@ -137,7 +137,7 @@ async def heartbeat(
     renewed BEFORE the block, and LONGPOLL_TIMEOUT + HEARTBEAT_INTERVAL <
     PRESENCE_TTL (§7.1), so an agent's own long-poll can never let its lease lapse.
     """
-    status, _agent = store.renew_presence(agent_id)
+    status, agent = store.renew_presence(agent_id)
 
     if status is PresenceStatus.UNKNOWN_AGENT:
         return JSONResponse(
@@ -164,17 +164,31 @@ async def heartbeat(
         )
 
     pending = directives.drain(agent_id)
+    if agent is not None and agent.state == AgentState.DRAINING:
+        # Derived from state, never queued: a directive that is a STATE must be
+        # re-sent every beat, so it survives a lost response and a TSS restart
+        # without a delivery protocol.
+        pending = [*pending, "drain"]
     if pending:
         return HeartbeatResponse(assignment=store.pending_assignment(agent_id), directives=pending)
 
     assignment = store.pending_assignment(agent_id)
-    if assignment is None and store.has_free_resources(agent_id):
+    if (
+        assignment is None
+        and agent is not None
+        and agent.state != AgentState.DRAINING
+        and store.has_free_resources(agent_id)
+    ):
+        # A draining bench is not waiting for work, so it must not block here.
         assignment = await scheduler.wait_for_assignment(agent_id)
 
     # Drained again after the long poll: a cancel may have been queued while we
     # were blocked here, and holding it for another heartbeat interval would let
     # the bench keep running something nobody wants.
-    return HeartbeatResponse(assignment=assignment, directives=directives.drain(agent_id))
+    trailing = directives.drain(agent_id)
+    if agent is not None and agent.state == AgentState.DRAINING:
+        trailing = [*trailing, "drain"]
+    return HeartbeatResponse(assignment=assignment, directives=trailing)
 
 
 @job_router.post("/{job_id}/start")

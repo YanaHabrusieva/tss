@@ -246,11 +246,26 @@ def assert_i5(store: Store, agent_id: str) -> None:
         assert resource.current_job_id is None, f"I5: {resource.id} still holds a job"
 
 
-def submit(store: Store, job_id: str, n_devices: int, *, name: str | None = None) -> None:
-    """A job needing `n_devices` identical devices, all on one bench."""
+def submit(
+    store: Store,
+    job_id: str,
+    n_devices: int,
+    *,
+    name: str | None = None,
+    caps: dict | None = None,
+    now: float | None = None,
+) -> None:
+    """A job needing `n_devices` identical devices, all on one bench.
+
+    PASS `now` IN ANY TEST THAT REASONS ON A SYNTHETIC CLOCK. `submitted_at`
+    defaults to wall-clock, and a job stamped `time.time()` is never starving
+    relative to a T0 of 1,000,000 — so the starvation and reservation paths
+    quietly do nothing and the test fails somewhere else entirely.
+    """
     store.submit_job(
         job_id,
         name or job_id,
-        [{"product": "vehicle_gateway"}] * n_devices,
+        [dict(caps or {"product": "vehicle_gateway"})] * n_devices,
         payload={"suite": "smoke"},
+        now=now,
     )

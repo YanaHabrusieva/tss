@@ -97,7 +97,9 @@ def test_re_registering_while_loaded_requeues_every_job_it_held(store):
 
 def test_re_registering_keeps_quarantine_unless_the_version_changed(store):
     register(store, version="0.1.0")
-    store.conn.execute("UPDATE agents SET state = 'quarantined' WHERE id = ?", (AGENT,))
+    store.conn.execute(
+        "UPDATE agents SET state = 'quarantined', quarantined_at = ? WHERE id = ?", (T0, AGENT)
+    )
 
     same = register(store, version="0.1.0", now=T0 + 1)
     assert same.quarantine_retained

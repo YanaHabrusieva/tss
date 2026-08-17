@@ -5,8 +5,13 @@
     tss watch          the same, live, pushed over a WebSocket
     tss why <job_id>   why that job is not running yet
 
-Three surfaces, one data source. The operator verbs (drain, unquarantine) arrive
-in step 7.
+    tss drain <agent>          finish current jobs, accept no more
+    tss unquarantine <target>  let a bench or a device back in
+    tss cancel <job_id>        stop a job
+
+Three surfaces, one data source. Every state machine transition that is not
+automatic has a verb here (§4.1, §4.2) — a state with no way out is a slow
+fleet-drain dressed up as a health feature.
 """
 
 from __future__ import annotations
@@ -250,6 +255,77 @@ def _device_line(device: dict) -> Text:
     return line
 
 
+def _post(args: argparse.Namespace, path: str, console: Console) -> dict | None:
+    try:
+        response = httpx.post(f"{args.url.rstrip('/')}{path}", timeout=10.0)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = ""
+        with contextlib.suppress(Exception):
+            detail = exc.response.json().get("detail", "")
+        console.print(f"[red]{exc.response.status_code}[/red] {detail or path}")
+        return None
+    except httpx.HTTPError as exc:
+        console.print(f"[red]cannot reach TSS at {args.url}[/red] ({exc.__class__.__name__})")
+        console.print("[dim]is `just serve` running?[/dim]")
+        return None
+    return response.json()
+
+
+def cmd_drain(args: argparse.Namespace) -> int:
+    console = Console()
+    if _post(args, f"/v1/agents/{args.agent}/drain", console) is None:
+        return 1
+    console.print(f"[bold]{args.agent}[/bold] is DRAINING — finishing its jobs, taking no more.")
+    console.print(
+        "[dim]It goes offline on its own once its lease expires. Restart the daemon "
+        "afterwards and it re-registers as online.[/dim]"
+    )
+    return 0
+
+
+def cmd_unquarantine(args: argparse.Namespace) -> int:
+    """One verb for both, told apart by the id itself: a resource id is
+    `bench:device` and an agent id is not."""
+    console = Console()
+    target = args.target
+    if ":" in target:
+        path = f"/v1/resources/{target}/unquarantine"
+        kind = "device"
+    else:
+        path = f"/v1/agents/{target}/unquarantine"
+        kind = "bench"
+    if _post(args, path, console) is None:
+        return 1
+    console.print(f"[bold]{target}[/bold] is back in rotation ({kind}, failure count reset).")
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    console = Console()
+    try:
+        response = httpx.delete(f"{args.url.rstrip('/')}/v1/jobs/{args.job_id}", timeout=10.0)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = ""
+        with contextlib.suppress(Exception):
+            detail = exc.response.json().get("detail", "")
+        console.print(f"[red]{exc.response.status_code}[/red] {detail}")
+        return 1
+    except httpx.HTTPError as exc:
+        console.print(f"[red]cannot reach TSS at {args.url}[/red] ({exc.__class__.__name__})")
+        return 1
+    body = response.json()
+    if body.get("was_running"):
+        console.print(
+            f"[bold]{args.job_id}[/bold] CANCELLED — its devices are free and the bench "
+            "has been told to stop."
+        )
+    else:
+        console.print(f"[bold]{args.job_id}[/bold] CANCELLED before it started.")
+    return 0
+
+
 def cmd_why(args: argparse.Namespace) -> int:
     console = Console()
     why = _get(args, f"/v1/jobs/{args.job_id}/why", console)
@@ -302,6 +378,15 @@ def main(argv: list[str] | None = None) -> int:
     why_cmd = sub.add_parser("why", help="why is this job not running?")
     why_cmd.add_argument("job_id")
 
+    drain_cmd = sub.add_parser("drain", help="finish current jobs, accept no more")
+    drain_cmd.add_argument("agent")
+
+    unq_cmd = sub.add_parser("unquarantine", help="let a bench or device back in")
+    unq_cmd.add_argument("target", help="agent id, or resource id as bench:device")
+
+    cancel_cmd = sub.add_parser("cancel", help="stop a job")
+    cancel_cmd.add_argument("job_id")
+
     args = parser.parse_args(argv)
     if args.command == "fleet":
         return cmd_fleet(args)
@@ -311,6 +396,12 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_watch(args)
     if args.command == "why":
         return cmd_why(args)
+    if args.command == "drain":
+        return cmd_drain(args)
+    if args.command == "unquarantine":
+        return cmd_unquarantine(args)
+    if args.command == "cancel":
+        return cmd_cancel(args)
     parser.error(f"unknown command {args.command}")
     return 2
 

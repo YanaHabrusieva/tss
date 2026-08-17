@@ -45,8 +45,8 @@ def test_two_jobs_run_side_by_side_on_one_bench(store, scheduler):
     3-device bench both start; if one waits, the agent is being treated as one
     indivisible thing and two thirds of the fleet is idle by construction."""
     devices = bench(store, devices=3)
-    submit(store, "job-A", 1)
-    submit(store, "job-B", 1)
+    submit(store, "job-A", 1, now=T0)
+    submit(store, "job-B", 1, now=T0)
 
     results = scheduler.pass_once(now=T0 + 1)
 
@@ -64,7 +64,7 @@ def test_two_jobs_run_side_by_side_on_one_bench(store, scheduler):
 def test_a_bench_fills_up_and_then_stops(store, scheduler):
     bench(store, devices=2)
     for i in range(4):
-        submit(store, f"job-{i}", 1)
+        submit(store, f"job-{i}", 1, now=T0)
 
     results = scheduler.pass_once(now=T0 + 1)
 
@@ -79,7 +79,7 @@ def test_the_scheduler_picks_the_least_recently_used_device(store, scheduler):
     # vg-01 has just run something; vg-02 ran long ago; vg-03 never has.
     store.conn.execute("UPDATE resources SET last_assigned_at = 900 WHERE id = ?", (devices[0],))
     store.conn.execute("UPDATE resources SET last_assigned_at = 100 WHERE id = ?", (devices[1],))
-    submit(store, "job-A", 1)
+    submit(store, "job-A", 1, now=T0)
 
     scheduler.pass_once(now=T0 + 1)
 
@@ -90,9 +90,9 @@ def test_the_scheduler_spreads_jobs_across_benches(store, scheduler):
     """Successive jobs should not pile onto one bench while its siblings idle."""
     bench(store, "bench-a", devices=1)
     bench(store, "bench-b", devices=1)
-    submit(store, "job-A", 1)
+    submit(store, "job-A", 1, now=T0)
     scheduler.pass_once(now=T0 + 1)
-    submit(store, "job-B", 1)
+    submit(store, "job-B", 1, now=T0)
     scheduler.pass_once(now=T0 + 2)
 
     assert store.get_job("job-A").agent_id != store.get_job("job-B").agent_id
@@ -105,7 +105,7 @@ def test_an_unsatisfiable_job_does_not_block_the_queue_behind_it(store, schedule
     whole fleet behind one job asking for hardware nobody has free."""
     bench(store, devices=1)  # vehicle gateways only
     store.submit_job("job-needs-ag", "ag test", [AG_CAPS], now=T0)
-    submit(store, "job-needs-vg", 1)
+    submit(store, "job-needs-vg", 1, now=T0)
 
     results = scheduler.pass_once(now=T0 + 1)
 
@@ -119,7 +119,7 @@ def test_offline_and_draining_benches_are_not_offered_work(store, scheduler, con
     bench(store, "bench-expired", devices=1, now=T0 - config.presence_ttl_s - 10)
     store.conn.execute("UPDATE agents SET state = 'draining' WHERE id = 'bench-draining'")
     for i in range(3):
-        submit(store, f"job-{i}", 1)
+        submit(store, f"job-{i}", 1, now=T0)
 
     results = scheduler.pass_once(now=T0 + 1)
 
@@ -141,7 +141,7 @@ def test_unhealthy_and_retired_devices_are_never_offered(store, scheduler):
     )
     store.report_resource_health("bench-sf-01", {"vg-01": "unhealthy"}, now=T0 + 3)
     for i in range(3):
-        submit(store, f"job-{i}", 1)
+        submit(store, f"job-{i}", 1, now=T0)
 
     results = scheduler.pass_once(now=T0 + 4)
 
@@ -154,7 +154,7 @@ def test_a_lost_claim_falls_through_to_the_next_bench(store, scheduler, monkeypa
     than dropping the job for this pass."""
     bench(store, "bench-a", devices=1)
     bench(store, "bench-b", devices=1)
-    submit(store, "job-A", 1)
+    submit(store, "job-A", 1, now=T0)
 
     real_claim = store.claim_all
     calls = []
@@ -237,8 +237,8 @@ def test_a_device_freed_during_a_pass_is_not_a_lost_wakeup(
     # loop for real, and the loop reads the presence lease against time.time().
     now = time.time()
     devices = bench(store, devices=1, now=now)
-    submit(store, "job-A", 1)
-    submit(store, "job-B", 1)
+    submit(store, "job-A", 1, now=T0)
+    submit(store, "job-B", 1, now=T0)
     assert store.claim_all("job-A", "bench-sf-01", devices[:1], now=now).ok
     assert store.start_job("job-A", "bench-sf-01", 1, now=now) == "started"
 

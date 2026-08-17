@@ -469,7 +469,7 @@ class Store:
         conn.execute("BEGIN IMMEDIATE")
         try:
             existing = conn.execute(
-                "SELECT state, agent_version FROM agents WHERE id = ?", (agent_id,)
+                "SELECT state, agent_version, quarantined_at FROM agents WHERE id = ?", (agent_id,)
             ).fetchone()
             requeued: list[str] = []
             dead_lettered: list[str] = []
@@ -494,10 +494,17 @@ class Store:
                     elif kind == "job.dead_letter":
                         dead_lettered.append(job_id)
 
+                # Keyed off `quarantined_at`, NOT the current state. A
+                # quarantined bench that is rebooted has its lease expire on the
+                # way down, so the reaper moves it to `offline` before it comes
+                # back — and reading `state` here would find `offline`, clear the
+                # quarantine, and hand work straight back to a machine nobody
+                # fixed. The mark is what survives; §4.1's rule is that only a
+                # NEW agent_version clears it.
                 quarantine_retained = (
                     existing["state"] == AgentState.QUARANTINED
-                    and existing["agent_version"] == agent_version
-                )
+                    or existing["quarantined_at"] is not None
+                ) and existing["agent_version"] == agent_version
                 conn.execute(
                     """UPDATE agents
                           SET hostname            = :hostname,
@@ -516,7 +523,11 @@ class Store:
                         "expires": now + ttl,
                         "now": now,
                         "version": agent_version,
-                        "quarantined_at": now if quarantine_retained else None,
+                        # Keep the ORIGINAL timestamp: "quarantined since 14:02"
+                        # is the useful fact, and restarting must not reset it.
+                        "quarantined_at": (
+                            (existing["quarantined_at"] or now) if quarantine_retained else None
+                        ),
                         "agent_id": agent_id,
                     },
                 )
@@ -1100,6 +1111,89 @@ class Store:
             self._rollback(conn)
             raise
         return kind
+
+    # ---------------------------------------------------------- operator verbs
+    def drain_agent(self, agent_id: str, *, now: float | None = None) -> str:
+        """Finish what you are running, accept nothing new (§4.1).
+
+        Needed for deploys: without it, upgrading an agent means killing running
+        tests. The matcher stops offering work the moment the state changes,
+        because `online_agents` only ever returns `online` ones.
+
+        THERE IS NO DRAINING -> OFFLINE TRANSITION, deliberately. The agent
+        finishes its jobs, reports them normally — a drained bench is not fenced,
+        so its results are accepted — and exits. Its lease then expires and the
+        ordinary presence sweep takes it offline with nothing left to requeue.
+        One mechanism, the same one that handles every other way a bench stops
+        being there.
+        """
+        now = time.time() if now is None else now
+        cur = self.conn.execute(
+            "UPDATE agents SET state = 'draining' WHERE id = ? AND state = 'online'",
+            (agent_id,),
+        )
+        if cur.rowcount != 1:
+            agent = self.get_agent(agent_id)
+            return "unknown_agent" if agent is None else f"not_online:{agent.state}"
+        running = self._distinct_jobs_on(self.conn, agent_id)
+        self.append_event(
+            "agent.draining", agent_id=agent_id, detail={"finishing": running}, now=now
+        )
+        return "draining"
+
+    def unquarantine_agent(self, agent_id: str, *, now: float | None = None) -> str:
+        """Let a machine back in (§4.2).
+
+        A state with no way out is a slow fleet-drain dressed up as a health
+        feature, which is why this exists at all. Clearing the failure count is
+        the point: the bench starts again from zero rather than being one bad job
+        away from going straight back out.
+        """
+        now = time.time() if now is None else now
+        agent = self.get_agent(agent_id)
+        if agent is None:
+            return "unknown_agent"
+        cur = self.conn.execute(
+            """UPDATE agents
+                  SET state = CASE WHEN state = 'quarantined' THEN 'online' ELSE state END,
+                      quarantined_at = NULL,
+                      consecutive_fails = 0
+                WHERE id = ?""",
+            (agent_id,),
+        )
+        if cur.rowcount != 1:
+            return "unknown_agent"
+        self.append_event(
+            "agent.unquarantined", agent_id=agent_id, detail={"was": str(agent.state)}, now=now
+        )
+        return "unquarantined"
+
+    def unquarantine_resource(self, resource_id: str, *, now: float | None = None) -> str:
+        """Let one device back in — the bench itself was never the problem."""
+        now = time.time() if now is None else now
+        resource = self.get_resource(resource_id)
+        if resource is None:
+            return "unknown_resource"
+        if resource.state == ResourceState.RETIRED:
+            # Retired is not a health state: this device is not on the bench any
+            # more, and un-quarantining it would put a ghost back in the pool.
+            return "retired"
+        self.conn.execute(
+            """UPDATE resources
+                  SET state = CASE WHEN state = 'unhealthy' THEN 'free' ELSE state END,
+                      quarantined_at = NULL,
+                      consecutive_fails = 0
+                WHERE id = ?""",
+            (resource_id,),
+        )
+        self.append_event(
+            "resource.unquarantined",
+            agent_id=resource.agent_id,
+            resource_id=resource_id,
+            detail={"was": str(resource.state)},
+            now=now,
+        )
+        return "unquarantined"
 
     # ------------------------------------------------------ unsatisfiable jobs
     def set_blocked_reason(

@@ -14,6 +14,10 @@ install:
 test *ARGS:
     {{py}} -m pytest {{ARGS}}
 
+# Everything except the seeded chaos runs, for a fast inner loop.
+test-fast *ARGS:
+    {{py}} -m pytest -m "not slow" {{ARGS}}
+
 # The same tests against the check-then-act claim in tests/naive_claim.py.
 # FAILURES ARE THE POINT: this is the evidence that test_allocation.py and
 # test_concurrency.py catch the bug they were written for (§7.5).
@@ -44,9 +48,15 @@ agent ID="bench-sf-01" DEVICES="3":
 fleet:
     {{py}} -m tss.cli.main fleet
 
-# --- arriving in later steps of the build order (§10) -------------------------
-
-# step 5: 15 agents x 2-4 devices, 100 jobs at 30% multi-device, 5 seeds — the merge gate
+# THE MERGE GATE: 15 agents x 2-4 devices, 100 jobs at 30% multi-device, 5 seeds.
+# Zero invariant violations, or the build fails.
 chaos:
-    @echo "not yet: the chaos suite lands in step 5 (§10)."
-    @exit 1
+    {{py}} -m tss.chaos.runner --agents 15 --jobs 100 --multi-pct 30 --seeds 5 --seed 1
+
+# Replay one failing seed, with the fleet's log lines.
+chaos-seed SEED:
+    {{py}} -m tss.chaos.runner --agents 15 --jobs 100 --multi-pct 30 --seed {{SEED}} -v
+
+# One profile in isolation — `just chaos-profile zombie`.
+chaos-profile PROFILE AGENTS="6" JOBS="20":
+    {{py}} -m tss.chaos.runner --agents {{AGENTS}} --jobs {{JOBS}} --profile {{PROFILE}} --seed 1 -v

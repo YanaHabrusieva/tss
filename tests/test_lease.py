@@ -90,6 +90,61 @@ def test_each_reported_job_is_fenced_independently(store):
     assert store.resources_held_by("job-keep") == [f"{AGENT}:vg-01"]
 
 
+def test_a_job_reassigned_to_the_SAME_bench_is_fenced_by_the_epoch_alone(store):
+    """The one scenario where the epoch is the only thing standing there.
+
+    Every other fenced path has a second guard that happens to cover it. A stale
+    report after a requeue is blocked by `agent_id IS NULL`; a report for a
+    finished job is blocked by `state IN ('assigned','running')`. Remove the
+    epoch check and chaos still passes, because those two catch everything it
+    generates.
+
+    Not this. The bench dies, its job is requeued, and the SAME bench comes back
+    and gets it again — a normal thing to happen on a small fleet. Now agent_id
+    matches, the state is live again, and only the epoch separates attempt 1's
+    late report from attempt 2's ownership. Without it, the first attempt's
+    result lands on the second attempt's run.
+
+    Found by sabotage (§8.1): removing the epoch check passed the chaos gate, so
+    the scenario is written directly rather than hoped for.
+    """
+    first = assigned_job(store, agent_id=AGENT, devices=1)
+    store.start_job("job-A", AGENT, first.epoch, now=T0)
+
+    # The bench goes quiet, is reaped, and the job comes back to the queue.
+    store.reap_agent(AGENT, now=T0 + 100)
+    assert store.get_job("job-A").state == JobState.QUEUED
+
+    # ...and the very same bench re-registers and picks it up again.
+    store.register_agent(AGENT, f"{AGENT}.local", inventory(1), now=T0 + 101)
+    second = store.claim_all("job-A", AGENT, [f"{AGENT}:vg-01"], now=T0 + 101)
+    assert second.ok
+    store.start_job("job-A", AGENT, second.epoch, now=T0 + 101)
+
+    job = store.get_job("job-A")
+    assert job.agent_id == AGENT, "same bench: agent_id cannot tell the attempts apart"
+    assert job.state == JobState.RUNNING, "live state: the state guard cannot either"
+    assert second.epoch > first.epoch, "only the epoch moved"
+
+    # Attempt 1's report finally arrives, from the same bench, for the same job.
+    late = store.complete_job("job-A", AGENT, first.epoch, Outcome.PASSED, now=T0 + 200)
+
+    assert late == "stale_epoch"
+    job = store.get_job("job-A")
+    assert job.state == JobState.RUNNING, "attempt 2 is still running"
+    assert job.outcome is None, "a result from attempt 1 must not land on attempt 2"
+    assert store.resources_held_by("job-A") == [f"{AGENT}:vg-01"], (
+        "attempt 2 still holds its devices — the stale report must not free them"
+    )
+
+    # ...and attempt 2's own report is accepted normally.
+    assert store.complete_job("job-A", AGENT, second.epoch, Outcome.FAILED, now=T0 + 201) == (
+        "accepted"
+    )
+    assert store.get_job("job-A").outcome == Outcome.FAILED
+    assert check_all(store) == []
+
+
 def test_a_job_reassigned_to_another_bench_is_fenced_from_the_first(store):
     claim = assigned_job(store, agent_id="bench-a")
     store.reap_agent("bench-a", now=T0 + 100)

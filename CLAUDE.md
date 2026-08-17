@@ -16,8 +16,10 @@ Read `TSS-Architecture.md` before changing anything in `tss/core/`. It is the sp
 
 Any change that could violate one of these needs a test proving it doesn't.
 
-- **I1** At most one agent believes it owns a job at any moment, and exactly one result is ever
-  accepted per job. (Execution is at-least-once by design; the *result* is exactly-once.)
+- **I1** At any instant at most one agent is AUTHORIZED to run a job — holds its *current* epoch —
+  and across the run at most one completion report is ever accepted for it. Not "believes it owns":
+  a partitioned zombie sincerely believes it owns the job it is still executing. Execution is
+  at-least-once by design; authorization and the *result* are exactly-once.
 - **I2** No resource is held by two jobs. Structural: `resources.current_job_id` is a single column,
   guarded by `WHERE state='free'` on claim.
 - **I3** Every submitted job reaches a terminal state within the run deadline.
@@ -29,7 +31,9 @@ Any change that could violate one of these needs a test proving it doesn't.
 - **I6** A hung job is terminated by the job-timeout sweep, not by presence expiry.
 - **I7** A terminal job's outcome is never overwritten.
 - **I8** A job in `assigned`/`running` holds **exactly** `resource_count` resources — never fewer,
-  never more. No partial allocation, ever.
+  never more — AND conversely every `current_job_id` points at a job still `assigned`/`running`.
+  Both directions: counted from the job's side alone, a device orphaned by a finished job is never
+  looked at. No partial allocation, ever.
 - **I9** At most one job reserves at a time, all its reservations are on one *feasible* agent, and no
   reserved resource is claimed by another job. *(Checked against scheduler state, not the DB —
   reservations deliberately leave no DB trace.)*
@@ -101,6 +105,9 @@ Any change that could violate one of these needs a test proving it doesn't.
 - Integration tests go over real HTTP. Never mock the transport; mocked tests pass while the real
   thing deadlocks.
 - Every chaos run logs its seed.
+- Before trusting a new check, sabotage the code and watch it fail. A checker nobody has seen fail is
+  not evidence. Record which harness caught it: concurrency bugs need threads, failure bugs need
+  chaos, latency bugs need timing assertions — each is blind to the other two.
 
 ## Working style
 

@@ -98,7 +98,7 @@ class TestbedAgent:
                 "running_jobs": [
                     {"job_id": job_id, "epoch": epoch} for job_id, epoch in self.running.items()
                 ],
-                "resource_health": {},
+                "resource_health": self.resource_health(),
             },
             timeout=self.longpoll_timeout_s + 10,
         )
@@ -122,6 +122,18 @@ class TestbedAgent:
             return None
         response.raise_for_status()
         return response.json()
+
+    # --- the two seams a mock bench needs. Both are real agent responsibilities
+    # (§11 lists executor.py and health.py separately); overriding them is how the
+    # chaos fleet misbehaves without reimplementing the protocol.
+    async def execute_job(self, job_id: str, resource_ids: list[str], payload: dict):
+        """Run the workload. Subclasses make it slow, hang, or crash."""
+        return await execute(job_id, resource_ids, payload)
+
+    def resource_health(self) -> dict[str, str]:
+        """What our own probes say about our devices. TSS never probes hardware
+        it cannot reach (§3.1)."""
+        return {}
 
     def abandon(self, job_id: str | None, *, why: str) -> None:
         """Stop running a job and release its devices locally — without reporting.
@@ -156,7 +168,9 @@ class TestbedAgent:
                 # Fenced out before we even began — someone else owns this now.
                 log.warning("start %s rejected (%s); abandoning", job_id, started.status_code)
                 return
-            result = await execute(job_id, assignment["resource_ids"], assignment["payload"])
+            result = await self.execute_job(
+                job_id, assignment["resource_ids"], assignment["payload"]
+            )
             done = await client.post(
                 f"{self.base_url}/v1/jobs/{job_id}/complete",
                 json={

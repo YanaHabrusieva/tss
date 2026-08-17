@@ -71,18 +71,33 @@ def check_i8(store: Store) -> list[str]:
     `complete_job` frees them with a single statement keyed on `current_job_id`
     rather than a loop.
     """
-    rows = store.conn.execute(
-        f"""SELECT j.id AS job_id, j.state, j.resource_count,
-                   (SELECT COUNT(*) FROM resources r WHERE r.current_job_id = j.id) AS held
-              FROM jobs j
-             WHERE j.state IN {HOLDING_STATES}"""
-    ).fetchall()
-    return [
+    violations = [
         f"I8: {row['job_id']} ({row['state']}) requires {row['resource_count']} "
         f"resources but holds {row['held']}"
-        for row in rows
+        for row in store.conn.execute(
+            f"""SELECT j.id AS job_id, j.state, j.resource_count,
+                       (SELECT COUNT(*) FROM resources r WHERE r.current_job_id = j.id) AS held
+                  FROM jobs j
+                 WHERE j.state IN {HOLDING_STATES}"""
+        )
         if row["held"] != row["resource_count"]
     ]
+
+    # ...and the converse, which is the half that catches an ORPHAN HOLD: a
+    # device still pointing at a job that is not holding anything any more.
+    # Counting from the job's side alone cannot see this — a release that frees
+    # one device of a finished job leaves the remaining device busy, owned by a
+    # terminal job, and every job-side count still balances. That device is lost
+    # to the fleet with nothing left to free it.
+    violations.extend(
+        f"I8: {row['id']} is held by {row['current_job_id']}, which is {row['state']}"
+        for row in store.conn.execute(
+            f"""SELECT r.id, r.current_job_id, j.state
+                  FROM resources r JOIN jobs j ON j.id = r.current_job_id
+                 WHERE r.current_job_id IS NOT NULL AND j.state NOT IN {HOLDING_STATES}"""
+        )
+    )
+    return violations
 
 
 def check_i6(store: Store) -> list[str]:
@@ -198,16 +213,29 @@ def check_i9(scheduler) -> list[str]:
                 f"I9: reserved {resource_id} is on {resource.agent_id}, "
                 f"but the reservation targets {reservation.agent_id}"
             )
-        # RESERVE IS NOT CLAIM. A reserved device must still be free and unowned;
-        # anything else means the reservation took hardware, which is the partial
-        # hold this design exists to prevent.
-        if resource.state != ResourceState.FREE:
-            violations.append(f"I9: reserved {resource_id} is {resource.state}, not free")
-        if resource.current_job_id is not None:
-            violations.append(f"I9: reserved {resource_id} is claimed by {resource.current_job_id}")
+        # RESERVE IS NOT CLAIM: a reserved device must not be owned by anyone
+        # ELSE. Phrased that way on purpose. The reserving job taking its own set
+        # is the reservation succeeding, and a reservation is a decision snapshot
+        # that the fleet keeps moving underneath — a device can legitimately go
+        # unhealthy a moment after it was withheld, and the next pass recomputes.
+        # Reporting that would be reporting the checker's staleness as the
+        # scheduler's bug, and a checker that cries wolf gets ignored.
+        if resource.current_job_id not in (None, reservation.job_id):
+            violations.append(
+                f"I9: reserved {resource_id} is claimed by {resource.current_job_id}, "
+                f"not by the reserving job {reservation.job_id}"
+            )
 
     if job is not None:
-        inventory = [r for r in resources.values() if r.agent_id == reservation.agent_id]
+        # Feasibility counts everything still cabled to the bench, including
+        # devices that are unhealthy right now: those get repaired, and the
+        # scheduler re-evaluates every pass. What this catches is the reservation
+        # that can NEVER be satisfied — two devices held for a three-device job.
+        inventory = [
+            r.model_copy(update={"state": ResourceState.FREE})
+            for r in resources.values()
+            if r.agent_id == reservation.agent_id and r.state != ResourceState.RETIRED
+        ]
         if not matcher.could_ever_satisfy(job.requirements, inventory):
             violations.append(
                 f"I9: reserving on {reservation.agent_id}, which could never satisfy "

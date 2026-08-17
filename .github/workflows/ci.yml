@@ -1,0 +1,33 @@
+name: ci
+
+# The gate is three things, in increasing order of what they cost and what they
+# prove: style, then the unit and integration suites, then chaos. Chaos is the
+# one that can actually catch a scheduler bug, so it runs on every push — a
+# merge gate you skip when you are in a hurry is a merge gate you do not have.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv --python 3.12 .venv
+      - run: uv pip install --python .venv/bin/python -e ".[dev]"
+
+      - name: lint
+        run: |
+          .venv/bin/python -m ruff check .
+          .venv/bin/python -m ruff format --check .
+
+      - name: tests
+        run: .venv/bin/python -m pytest
+
+      # 15 agents x 2-4 devices, 100 jobs at 30% multi-device, 5 seeds.
+      # Any invariant violation fails the build and names the seed to replay.
+      - name: chaos (merge gate)
+        run: .venv/bin/python -m tss.chaos.runner --agents 15 --jobs 100 --multi-pct 30 --seeds 5 --seed 1

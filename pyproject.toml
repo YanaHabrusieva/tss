@@ -36,6 +36,7 @@ addopts = "-q --strict-markers"
 python_classes = []
 markers = [
     "concurrency: threaded races against real SQLite connections",
+    "slow: seeded chaos runs — minutes, not milliseconds",
 ]
 
 [tool.ruff]

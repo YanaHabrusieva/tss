@@ -675,24 +675,43 @@ show two owners because the reaper clears the dead one. Checking TSS against its
 
 | # | Invariant | Kind | Checked against |
 |---|---|---|---|
-| I1 | At most one agent **believes it owns** a job at any moment, and exactly one result is ever accepted per job | safety | agent ground truth + `jobs.epoch` |
+| I1 | At any instant at most one agent is **authorized** to run a job — holds its *current* epoch; and across the run at most one completion report is ever accepted for it | safety | agent ground truth + `jobs.epoch` + event log |
 | I2 | No **resource** is held by two jobs | safety | DB — structural, see below |
 | I3 | Every submitted job reaches a terminal state within the run deadline | **liveness** | DB, end of run |
 | I4 | A job never runs on resources lacking its required capabilities | safety | **agent ground truth**, not TSS's copy |
 | I5 | No resource of an `offline` agent is `busy` or holds a `current_job_id` | safety | DB |
 | I6 | A hung job is terminated by the job-timeout sweep, not by presence expiry | safety | DB + timing |
 | I7 | A terminal job's outcome is never overwritten | safety | DB, event log |
-| **I8** | **A job in `assigned`/`running` holds exactly as many resources as it required — never fewer, never more** | safety | DB |
+| **I8** | **A job in `assigned`/`running` holds exactly as many resources as it required — never fewer, never more — and conversely every `current_job_id` points at a job that is still `assigned` or `running`** | safety | DB |
 | **I9** | **At most one job reserves at a time, all its reservations are on a single feasible agent, and no reserved resource is claimed by another job** | safety | scheduler state |
+
+**I8 needs both directions, and the second one is easy to omit.** Counted only from the job's side,
+a device left held by a job that already finished balances every check — the job is terminal, so it
+isn't examined, and the orphaned device is never looked at. Sabotaging a release to free only the
+first of a job's devices produces exactly that state and passes a one-directional I8 silently. The
+converse — every `current_job_id` points at a live job — is what catches it.
 
 **I8 is the one this whole revision exists for.** It is the machine-checkable form of "never a partial
 allocation." Any bug in the N-way claim — a missing rollback, a rowcount not checked, a resource freed
 early — shows up here immediately, and nowhere else.
 
-**On I1 and honest wording.** An earlier draft said "no job is *running* on two live agents at once,"
-which §7.4 openly contradicts and which the zombie scenario deliberately violates (agent-7 and agent-3
-both execute J between t=14 and t=40). Fencing buys single-**result**, not single-**execution**. State
-it that way. An invariant your own demo breaks is worse than no invariant.
+**On I1, and why this wording keeps slipping.** Two earlier drafts got it wrong in the same direction.
+"No job is *running* on two live agents at once" is contradicted by §7.4 outright. "At most one agent
+*believes* it owns a job" is no better — during a partition the zombie sincerely believes it owns the
+job it is still executing, so the flagship demo violates the flagship invariant.
+
+The guarantee is not about execution and not about belief. It is about **authorization**: at most one
+agent holds the job's *current* epoch. A partitioned agent still running the work is no longer
+authorized — its epoch is stale — and that is precisely what fencing means. Checkable directly: for
+each job, count the agents whose ground-truth `(job_id, epoch)` matches TSS's current epoch; that
+count is never above one.
+
+The second half — at most one accepted completion per job — is the stronger of the two in practice,
+because it is read from the event log over the whole run rather than sampled. A checker that samples
+periodically can miss a transient authorization overlap; it cannot miss a second accepted result.
+
+**If an invariant your own demo breaks survives into the checker, the checker teaches you to ignore
+it.** That is worse than not having it.
 
 **On I2 and structural enforcement.** `resources.current_job_id` is a single nullable column, so a
 resource physically cannot reference two jobs — I2 is structural by construction, and the
@@ -1244,6 +1263,34 @@ one an implementation will get wrong, and it fails silently: the queue just stop
 **Make it a 3-device bench and 2-device jobs.** Fifty threads all claiming one resource proves less
 than fifty threads claiming *overlapping pairs* from a pool of three. The second setup catches partial
 allocation, which is the bug that actually matters now, and it's barely more code.
+
+### 8.1 Sabotage the code and watch the checker fail
+
+A test suite you have only ever seen pass tells you the code passes its tests. It does not tell you
+the tests would notice if the code were wrong. Before trusting the gate, break things on purpose —
+one line at a time, run the suite, and record what caught it.
+
+The useful result is not that everything gets caught. It is discovering **which harness is blind to
+which class of bug**, because that is not obvious in advance and it changes what you write next:
+
+| Bug class | Caught by | Blind to it |
+|---|---|---|
+| **Concurrency** — the claim's `state='free'` guard removed | OS threads on separate connections | Chaos. One scheduler running one pass at a time never generates the interleaving; the race is structurally unreachable there, however long you run it. |
+| **Failure** — release frees only the first device; reaper skips a requeue | Chaos + invariants | Unit tests. The state is only reachable after a specific failure sequence nobody would write by hand. |
+| **Latency** — a directive parked behind a long-poll; dead air after registration | Timing assertions, and the live demo | Both of the above. Everything is correct; it is just dead for N seconds, and no correctness assertion has an opinion about time. |
+
+Three harnesses, three blind spots, and each one silent about the others. This is a better answer to
+*"how did you know it was good enough?"* than any coverage number: you know what your tests catch
+because you have watched them catch it, and you know what they miss because you have watched them
+miss it.
+
+**Watch for guards that mask each other.** A sabotage that gets caught anyway may mean the line is
+redundant — or that the scenario where it is uniquely load-bearing simply was not generated. Removing
+the epoch check from `/complete` passes chaos, because `agent_id IS NULL` after a requeue blocks the
+stale report on its own. But **a job requeued and then reassigned to the same bench** has a matching
+`agent_id` and a live state again, and only the epoch distinguishes attempt 1's late report from
+attempt 2's. That path is narrow enough that a hundred jobs across fifteen benches will usually not
+produce it. Write it directly rather than hoping chaos finds it.
 
 **Coverage is the wrong metric; invariants are the right one.** You can have 95% line coverage and still
 double-book a device. State the bar as "nine invariants hold across every seed CI runs" — a threshold

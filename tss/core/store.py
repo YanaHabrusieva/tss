@@ -768,17 +768,117 @@ class Store:
                 )
                 accepted = "accepted"
 
+            held = [
+                row["id"]
+                for row in conn.execute(
+                    "SELECT id FROM resources WHERE current_job_id = ? ORDER BY id", (job_id,)
+                )
+            ]
             # Every device this job holds, in one statement. Not a loop.
             conn.execute(
                 """UPDATE resources SET state = 'free', current_job_id = NULL
                     WHERE current_job_id = :job_id AND state = 'busy'""",
                 {"job_id": job_id},
             )
+            # Blame AFTER the release: quarantining a device means moving it out
+            # of `free`, and doing that first would only have it freed back.
+            self._attribute_failure(conn, agent_id, held, outcome=outcome, now=now)
             conn.execute("COMMIT")
         except BaseException:
             self._rollback(conn)
             raise
         return accepted
+
+    def _attribute_failure(
+        self,
+        conn: sqlite3.Connection,
+        agent_id: str,
+        resource_ids: Sequence[str],
+        *,
+        outcome: Outcome,
+        now: float,
+    ) -> None:
+        """Blame the device or blame the machine — never both, never neither (§4.2).
+
+        Failures clustered on ONE resource mean a bad device: quarantine that
+        device and the bench keeps working on its others. Failures spanning
+        SEVERAL resources on one machine mean a bad machine: quarantine the
+        machine. Conflating them is how one unplugged cable costs you a third of
+        the fleet, or how a broken bench keeps being handed work forever.
+
+        A pass clears the slate: `consecutive_fails` means consecutive.
+        """
+        if outcome not in (Outcome.INFRA_ERROR, Outcome.FAILED):
+            # A pass clears the slate: `consecutive_fails` means consecutive.
+            placeholders = ",".join("?" * len(resource_ids))
+            conn.execute(
+                f"UPDATE resources SET consecutive_fails = 0 WHERE id IN ({placeholders})",
+                tuple(resource_ids),
+            )
+            conn.execute("UPDATE agents SET consecutive_fails = 0 WHERE id = ?", (agent_id,))
+            return
+        if outcome is Outcome.FAILED:
+            # The firmware misbehaved. That is the engineer's problem and says
+            # nothing at all about the hardware (§4.3).
+            return
+
+        threshold = self.config.quarantine_threshold
+        for resource_id in resource_ids:
+            conn.execute(
+                "UPDATE resources SET consecutive_fails = consecutive_fails + 1 WHERE id = ?",
+                (resource_id,),
+            )
+        conn.execute(
+            "UPDATE agents SET consecutive_fails = consecutive_fails + 1 WHERE id = ?", (agent_id,)
+        )
+        row = conn.execute(
+            "SELECT consecutive_fails FROM agents WHERE id = ?", (agent_id,)
+        ).fetchone()
+        if row is None or row["consecutive_fails"] < threshold:
+            return
+
+        # Threshold reached. Now the attribution: it is the SPREAD of the
+        # failures that says whether the device or the machine is at fault.
+        implicated = [
+            r["id"]
+            for r in conn.execute(
+                """SELECT id FROM resources
+                    WHERE agent_id = ? AND consecutive_fails > 0 ORDER BY id""",
+                (agent_id,),
+            )
+        ]
+        # Blame assigned; the count starts again from here either way.
+        conn.execute("UPDATE agents SET consecutive_fails = 0 WHERE id = ?", (agent_id,))
+
+        if len(implicated) >= 2:
+            conn.execute(
+                """UPDATE agents SET state = 'quarantined', quarantined_at = :now
+                    WHERE id = :agent_id AND state NOT IN ('offline','quarantined')""",
+                {"now": now, "agent_id": agent_id},
+            )
+            self._insert_event(
+                conn,
+                kind="agent.quarantined",
+                ts=now,
+                agent_id=agent_id,
+                detail={"consecutive_fails": threshold, "devices": implicated},
+            )
+            return
+
+        for resource_id in implicated:
+            conn.execute(
+                """UPDATE resources SET state = 'unhealthy', quarantined_at = :now
+                    WHERE id = :id AND state NOT IN ('retired','busy')""",
+                {"now": now, "id": resource_id},
+            )
+            self._insert_event(
+                conn,
+                kind="resource.quarantined",
+                ts=now,
+                agent_id=agent_id,
+                resource_id=resource_id,
+                detail={"consecutive_fails": threshold},
+            )
 
     def _diagnose_fence(self, job_id: str, agent_id: str, epoch: int) -> str:
         """Why a fenced write matched nothing. Everything here means the same

@@ -317,15 +317,43 @@ def test_i9_catches_a_reservation_that_took_hardware(store, scheduler, config):
     assert check_i9(scheduler) == []
 
     reserved = next(iter(scheduler.reservation.resource_ids))
+    submit(store, "job-thief", 1, at=T0)
     store.conn.execute(
-        "UPDATE resources SET state = 'busy', current_job_id = 'job-big' WHERE id = ?",
+        "UPDATE resources SET state = 'busy', current_job_id = 'job-thief' WHERE id = ?",
         (reserved,),
     )
 
     violations = check_i9(scheduler)
-    assert len(violations) == 2
-    assert any("not free" in v for v in violations)
-    assert any("is claimed by" in v for v in violations)
+
+    assert len(violations) == 1
+    assert "claimed by job-thief" in violations[0]
+    assert "not by the reserving job job-big" in violations[0]
+
+
+def test_i9_does_not_cry_wolf_when_the_reserving_job_takes_its_own_set(store, scheduler, config):
+    """The reservation succeeding is not a violation, and a fleet that moves
+    under a sampled checker is not one either. A checker that reports its own
+    staleness gets ignored, which costs you every real violation after it."""
+    devices = bench(store, "bench-01", devices=2)
+    occupy(store, "bench-01", devices[:1])
+    submit(store, "job-big", 2, at=T0)
+    tick(scheduler, store, T0 + STARVED)
+    reserved = next(iter(scheduler.reservation.resource_ids))
+
+    # The reserving job gets its set...
+    store.conn.execute(
+        "UPDATE resources SET state = 'busy', current_job_id = 'job-big' WHERE id = ?",
+        (reserved,),
+    )
+    assert check_i9(scheduler) == []
+
+    # ...and a device going unhealthy under a stale reservation is the fleet
+    # changing, not the scheduler misbehaving: the next pass recomputes.
+    store.conn.execute(
+        "UPDATE resources SET state = 'unhealthy', current_job_id = NULL WHERE id = ?",
+        (reserved,),
+    )
+    assert check_i9(scheduler) == []
 
 
 def test_i9_catches_a_reservation_on_a_bench_that_could_never_satisfy_it(store, scheduler, config):

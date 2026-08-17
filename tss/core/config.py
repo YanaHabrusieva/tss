@@ -45,6 +45,9 @@ class Config:
 
     # --- jobs ----------------------------------------------------------------
     default_max_duration_s: int = 600
+    #: Matching is a backtracking search; real HIL tests need a handful of
+    #: devices, and this keeps one absurd job from pinning a scheduling pass.
+    max_resources_per_job: int = 8
 
     # --- storage (§3.3) -------------------------------------------------------
     db_path: str = "tss.db"

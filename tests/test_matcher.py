@@ -194,6 +194,120 @@ def test_ranking_skips_benches_that_cannot_satisfy_the_job():
     assert [m.agent_id for m in matches] == ["bench-02"]
 
 
+# ------------------------------------------------- N-of-M: the greedy failure
+def test_a_permissive_spec_must_not_eat_the_device_a_strict_one_needs():
+    """The bug greedy has and backtracking does not.
+
+    One bench, two vehicle gateways on different harnesses. The job needs "any
+    VG" and "a j1939 VG" — vg-02 + vg-01 satisfies it exactly. A greedy walk
+    hands vg-01 (which sorts first by LRU) to the permissive spec, then finds
+    nothing left with a j1939 harness and reports no match: a job left queued in
+    front of hardware that could run it.
+
+    This is maximum bipartite matching, and greedy is not an algorithm for it.
+    """
+    pool = [
+        resource("vg-01", VG_J1939, last_assigned_at=100.0),  # sorts first
+        resource("vg-02", VG_OBD2, last_assigned_at=200.0),
+    ]
+    specs = [{"product": "vehicle_gateway"}, {"product": "vehicle_gateway", "harness": "j1939"}]
+
+    match = matcher.match_on_agent(specs, pool)
+
+    assert match is not None, "a valid assignment exists: vg-02 for spec 0, vg-01 for spec 1"
+    assert match.resource_ids == ["bench-01:vg-02", "bench-01:vg-01"]
+
+
+def test_the_same_job_matches_whichever_order_its_requirements_are_written_in():
+    """The asymmetry is the tell. Under greedy, the strict-first ordering happens
+    to work and the permissive-first ordering does not — so whether a job runs
+    depends on the order an engineer typed its requirements, which is not
+    something anyone could be expected to know."""
+    pool = [
+        resource("vg-01", VG_J1939, last_assigned_at=100.0),
+        resource("vg-02", VG_OBD2, last_assigned_at=200.0),
+    ]
+    strict_first = [{"harness": "j1939"}, {"product": "vehicle_gateway"}]
+    permissive_first = [{"product": "vehicle_gateway"}, {"harness": "j1939"}]
+
+    one = matcher.match_on_agent(strict_first, pool)
+    two = matcher.match_on_agent(permissive_first, pool)
+
+    assert one is not None and two is not None
+    assert set(one.resource_ids) == set(two.resource_ids) == {"bench-01:vg-01", "bench-01:vg-02"}
+
+
+def test_backtracking_gives_up_only_when_no_assignment_exists():
+    pool = [
+        resource("vg-01", VG_OBD2),
+        resource("vg-02", VG_OBD2),
+    ]
+    # Two devices, but only obd2 ones: a j1939 requirement genuinely cannot be met.
+    specs = [{"product": "vehicle_gateway"}, {"harness": "j1939"}]
+    assert matcher.match_on_agent(specs, pool) is None
+    # ...and one j1939 device cannot satisfy two j1939 specs.
+    one_each = [resource("vg-01", VG_J1939), resource("vg-02", VG_OBD2)]
+    assert matcher.match_on_agent([{"harness": "j1939"}, {"harness": "j1939"}], one_each) is None
+
+
+def test_a_three_device_job_takes_three_distinct_devices():
+    pool = [resource(f"vg-{i:02d}", VG_J1939, last_assigned_at=float(i)) for i in range(1, 5)]
+    specs = [{"harness": "j1939"}] * 3
+
+    match = matcher.match_on_agent(specs, pool)
+
+    assert len(set(match.resource_ids)) == 3
+    assert match.resource_ids == ["bench-01:vg-01", "bench-01:vg-02", "bench-01:vg-03"], (
+        "still LRU-ordered: backtracking tries the oldest device first"
+    )
+
+
+def test_a_mixed_job_matches_across_products():
+    """The shape the two-level model exists for: a gateway-to-gateway test needing
+    a heavy-duty VG and an AG on the SAME bench (§3.4)."""
+    pool = [
+        resource("vg-01", VG_OBD2),
+        resource("vg-02", VG_J1939),
+        resource("ag-01", AG),
+    ]
+    specs = [{"product": "vehicle_gateway", "harness": "j1939"}, {"product": "asset_gateway"}]
+
+    match = matcher.match_on_agent(specs, pool)
+
+    assert match.resource_ids == ["bench-01:vg-02", "bench-01:ag-01"]
+
+
+# ------------------------------------------------------- the feasibility filter
+def test_feasibility_ignores_whether_devices_are_free_right_now():
+    """§3.4.1 step 1, and the easy one to skip. A bench with three healthy VGs can
+    satisfy a 3-VG job eventually, however busy it is at this instant."""
+    busy = [resource(f"vg-{i:02d}", VG_J1939, state=ResourceState.BUSY) for i in range(1, 4)]
+
+    assert matcher.could_ever_satisfy([{"harness": "j1939"}] * 3, busy)
+    assert matcher.match_on_agent([{"harness": "j1939"}] * 3, busy) is None, "not right now"
+
+
+def test_a_bench_with_too_few_healthy_devices_can_never_satisfy_the_job():
+    """Reserving here would idle a device forever, for nothing."""
+    pool = [
+        resource("vg-01", VG_J1939),
+        resource("vg-02", VG_J1939, state=ResourceState.UNHEALTHY),
+        resource("vg-03", VG_J1939, state=ResourceState.RETIRED),
+    ]
+
+    assert matcher.could_ever_satisfy([{"harness": "j1939"}], pool)
+    assert not matcher.could_ever_satisfy([{"harness": "j1939"}] * 2, pool), (
+        "broken and departed devices are not capacity"
+    )
+
+
+def test_feasibility_uses_the_same_assignment_logic_as_matching():
+    """A bench that only *looks* feasible by counting devices is not feasible."""
+    pool = [resource("vg-01", VG_OBD2), resource("vg-02", VG_OBD2)]
+
+    assert not matcher.could_ever_satisfy([{"harness": "j1939"}, {"harness": "obd2"}], pool)
+
+
 def test_the_matcher_touches_no_store(monkeypatch):
     """A guard against the boundary rotting: the matcher must not learn to read."""
     import tss.core.matcher as matcher_module

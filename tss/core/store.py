@@ -63,6 +63,8 @@ REASON_DB_BUSY = "db_busy"
 DETAIL_TIMEOUT = "timeout"  # sweep 2: the job hung, the bench was fine
 DETAIL_PRESENCE = "presence_expired"  # sweep 1: the machine died
 DETAIL_CANCELLED = "cancelled_by_client"
+#: `blocked_reason` on a queued job nobody in the fleet can run (§3.4.1).
+BLOCKED_NO_CAPABLE_AGENT = "no_capable_agent"
 DETAIL_REREGISTERED = "agent_reregistered"
 
 _BUSY_ERRCODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
@@ -182,7 +184,8 @@ UPDATE jobs
        epoch        = epoch + 1,
        attempt      = attempt + 1,
        tried_agents = json_insert(tried_agents, '$[#]', :agent_id),
-       assigned_at  = :now
+       assigned_at  = :now,
+       blocked_reason = NULL   -- it just ran; whatever blocked it no longer does
  WHERE id = :job_id
    AND state = 'queued'
    AND resource_count = :n
@@ -980,6 +983,72 @@ class Store:
             self._rollback(conn)
             raise
         return kind
+
+    # ------------------------------------------------------ unsatisfiable jobs
+    def set_blocked_reason(
+        self, job_id: str, reason: str | None, *, now: float | None = None
+    ) -> bool:
+        """Annotate a queued job with why it is not moving. Returns True if this
+        changed anything, so the caller can emit the event exactly once.
+
+        The job stays QUEUED. Fleets change — a bench gets repaired,
+        un-quarantined or added — and a job that cannot run on today's fleet may
+        run on tomorrow's (§3.4.1).
+        """
+        now = time.time() if now is None else now
+        cur = self.conn.execute(
+            """UPDATE jobs SET blocked_reason = :reason
+                WHERE id = :job_id AND state = 'queued'
+                  AND (blocked_reason IS NOT :reason)""",
+            {"reason": reason, "job_id": job_id},
+        )
+        if cur.rowcount != 1:
+            return False
+        if reason is not None:
+            self.append_event(
+                "job.unsatisfiable", job_id=job_id, detail={"reason": reason}, now=now
+            )
+        return True
+
+    def dead_letter_unsatisfiable(self, job_id: str, *, now: float | None = None) -> bool:
+        """Give up on a job no bench could ever run (§3.4.1, UNSATISFIABLE_TIMEOUT).
+
+        Not a retry path and not a bench's fault, but still infrastructure's
+        problem rather than the engineer's: nobody in the fleet has the hardware
+        this job asked for. Hence `outcome='infra_error'` with the specifics in
+        result_detail — never `outcome='dead_letter'`, which is a state.
+        """
+        now = time.time() if now is None else now
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                """UPDATE jobs
+                      SET state = 'dead_letter', outcome = 'infra_error',
+                          result_detail = :detail, finished_at = :now, epoch = epoch + 1
+                    WHERE id = :job_id AND state = 'queued'""",
+                {
+                    "job_id": job_id,
+                    "now": now,
+                    "detail": f"{BLOCKED_NO_CAPABLE_AGENT} after "
+                    f"{int(self.config.unsatisfiable_timeout_s)}s",
+                },
+            )
+            if cur.rowcount != 1:
+                self._rollback(conn)
+                return False
+            self._insert_event(
+                conn,
+                kind="job.dead_letter",
+                ts=now,
+                job_id=job_id,
+                detail={"reason": BLOCKED_NO_CAPABLE_AGENT},
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            self._rollback(conn)
+            raise
+        return True
 
     # --------------------------------------------------------------- cancel
     def cancel_job(self, job_id: str, *, now: float | None = None) -> str:

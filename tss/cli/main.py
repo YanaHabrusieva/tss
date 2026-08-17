@@ -121,11 +121,22 @@ def render_queue(queue: dict, console: Console) -> None:
         needs = " + ".join(
             ",".join(f"{k}={v}" for k, v in spec.items()) for spec in job["requirements"]
         )
-        why = job["blocked_reason"] or ""
+        if job["resource_count"] > 1:
+            needs = f"{job['resource_count']}x on ONE bench: {needs}"
+        why = Text()
+        if job.get("reserving_on"):
+            # The non-obvious answer to "why am I waiting" once jobs need several
+            # devices — and nine times out of ten the thing that looks like a
+            # scheduler bug is this, working correctly (§3.9).
+            why.append(f"RESERVING on {job['reserving_on']}", style="bold cyan")
+        elif job["blocked_reason"] == "no_capable_agent":
+            why.append("UNSATISFIABLE — no bench in the fleet can run this", style="bold red")
+        elif job["blocked_reason"]:
+            why.append(job["blocked_reason"], style="yellow")
         if job["attempt"]:
-            why = (
-                why + f" retry {job['attempt']}, tried {len(job['tried_agents'])} bench(es)"
-            ).strip()
+            why.append(
+                f"  retry {job['attempt']}, tried {len(job['tried_agents'])} bench(es)", "dim"
+            )
         queued.add_row(job["job_id"], job["name"], needs, f"{job['waited_s']:.0f}s", why)
 
     console.print(f"[bold]RUNNING[/bold] ({len(queue['running'])})")

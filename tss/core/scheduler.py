@@ -27,13 +27,40 @@ import contextlib
 import logging
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 
 from tss.core import matcher
 from tss.core.config import DEFAULT, Config
-from tss.core.models import Assignment, ClaimResult, Resource
-from tss.core.store import Store
+from tss.core.models import Assignment, ClaimResult, Job, Resource, ResourceState
+from tss.core.store import BLOCKED_NO_CAPABLE_AGENT, Store
 
 log = logging.getLogger("tss.scheduler")
+
+
+@dataclass(frozen=True)
+class Reservation:
+    """Devices withheld from other jobs so a starving one can eventually run.
+
+    RESERVE IS NOT CLAIM, and this distinction carries the whole safety argument
+    (§3.4.1). The resources named here are still `free` in the database with no
+    owner; nothing is written anywhere. A job that needs three devices and can
+    see one free DOES NOT TAKE IT — it takes nothing, and the scheduler merely
+    declines to offer that device to anyone else.
+
+    That is wait-WITHOUT-hold, so no cycle can form. The moment a reservation
+    marks a resource busy or sets `current_job_id`, it has re-invented the
+    partial hold and §7.5's deadlock is back — and I8 will not catch it, because
+    the job is not assigned yet.
+
+    Held in scheduler memory and recomputed from scratch every pass, so a crash
+    mid-wait leaves nothing to clean up, and the target follows the fleet: if
+    another bench frees a full set first, the job takes that instead.
+    """
+
+    job_id: str
+    agent_id: str
+    resource_ids: frozenset[str]
+    since: float
 
 
 class Scheduler:
@@ -41,6 +68,10 @@ class Scheduler:
         self.store = store
         self.config = config
         self.passes = 0
+        #: At most ONE reservation exists at a time (§3.4.1). Two jobs each
+        #: holding partial sets is a deadlock you built yourself — in bookkeeping
+        #: rather than in hardware, but with the same outcome.
+        self.reservation: Reservation | None = None
         self._wake = asyncio.Event()
         self._agent_wake: dict[str, asyncio.Event] = {}
         self._task: asyncio.Task | None = None
@@ -61,20 +92,40 @@ class Scheduler:
         now = time.time() if now is None else now
         jobs = self.store.queued_jobs()
         if not jobs:
+            self.reservation = None  # nothing to starve, nothing to withhold
             self.passes += 1
             return []
 
         online = {agent.id for agent in self.store.online_agents(now=now)}
+        resources = self.store.list_resources()
+        installed_by_agent: dict[str, list[Resource]] = defaultdict(list)
         free_by_agent: dict[str, list[Resource]] = defaultdict(list)
-        for resource in matcher.offerable(self.store.list_resources()):
+        for resource in resources:
+            if resource.agent_id not in online:
+                continue
+            installed_by_agent[resource.agent_id].append(resource)
+        for resource in matcher.offerable(resources):
             if resource.agent_id in online:
                 free_by_agent[resource.agent_id].append(resource)
+
+        # Reservations are computed FIRST (§3.4 step 2): the walk below has to
+        # know which devices are being held for the starving job before it starts
+        # handing them out.
+        self.reservation = self._recompute_reservation(jobs, installed_by_agent, free_by_agent, now)
+        reserved = self.reservation.resource_ids if self.reservation else frozenset()
 
         results: list[ClaimResult] = []
         for job in jobs:
             if not free_by_agent:
                 break
-            for candidate in matcher.rank_matches(job.requirements, free_by_agent):
+            offer = free_by_agent
+            if reserved and (self.reservation is None or job.id != self.reservation.job_id):
+                offer = {
+                    agent_id: [r for r in pool if r.id not in reserved]
+                    for agent_id, pool in free_by_agent.items()
+                }
+                offer = {a: pool for a, pool in offer.items() if pool}
+            for candidate in matcher.rank_matches(job.requirements, offer):
                 result = self.store.claim_all(
                     job.id, candidate.agent_id, candidate.resource_ids, now=now
                 )
@@ -102,6 +153,106 @@ class Scheduler:
 
         self.passes += 1
         return results
+
+    # -------------------------------------------------------- reservations
+    def _recompute_reservation(
+        self,
+        jobs: list[Job],
+        installed_by_agent: dict[str, list[Resource]],
+        free_by_agent: dict[str, list[Resource]],
+        now: float,
+    ) -> Reservation | None:
+        """Three steps, and step 1 is the one that is easy to miss (§3.4.1).
+
+        Recomputed from scratch every pass. That is what makes a reservation
+        released "the instant it stops being needed" a property of the design
+        rather than of some cleanup path: a job that dispatched, was cancelled or
+        dead-lettered simply is not the oldest starving job any more, so nothing
+        is withheld on the very next pass.
+        """
+        starving = self._oldest_starving_job(jobs, free_by_agent, now)
+        if starving is None:
+            return None
+
+        # STEP 1 — feasibility. Only benches whose total installed inventory
+        # could ever satisfy this job, ignoring what is free right now.
+        feasible = {
+            agent_id: pool
+            for agent_id, pool in installed_by_agent.items()
+            if matcher.could_ever_satisfy(starving.requirements, pool)
+        }
+        if not feasible:
+            # Nothing to reserve TOWARD. Reserving here would idle devices
+            # forever for a job no bench can run, and from the outside that is
+            # indistinguishable from a broken scheduler (§3.4.1).
+            self._mark_unsatisfiable(starving, now)
+            return None
+        self._clear_unsatisfiable(starving)
+
+        # STEP 2 — pick exactly ONE target: closest to satisfying the job (most
+        # matching devices already free), tie-broken on fewest busy. Reserving
+        # across benches would idle devices to assemble a set that can never be
+        # assembled, because allocation is single-bench (§1.2).
+        def score(agent_id: str) -> tuple[int, int, str]:
+            free_here = [
+                r
+                for r in free_by_agent.get(agent_id, [])
+                if any(matcher.satisfies(r, spec) for spec in starving.requirements)
+            ]
+            busy_here = sum(1 for r in feasible[agent_id] if r.state == ResourceState.BUSY)
+            return (-len(free_here), busy_here, agent_id)
+
+        target = min(feasible, key=score)
+
+        # STEP 3 — withhold that bench's free matching devices. Everything on
+        # every other bench keeps flowing.
+        held = frozenset(
+            r.id
+            for r in free_by_agent.get(target, [])
+            if any(matcher.satisfies(r, spec) for spec in starving.requirements)
+        )
+        previous = self.reservation
+        since = (
+            previous.since
+            if previous and previous.job_id == starving.id and previous.agent_id == target
+            else now
+        )
+        if previous is None or previous.job_id != starving.id:
+            log.info("%s is starving; reserving on %s", starving.id, target)
+        return Reservation(job_id=starving.id, agent_id=target, resource_ids=held, since=since)
+
+    def _oldest_starving_job(
+        self, jobs: list[Job], free_by_agent: dict[str, list[Resource]], now: float
+    ) -> Job | None:
+        """The oldest queued job that has waited too long AND cannot run now.
+
+        At most one, always the oldest. One reserver can eventually be satisfied
+        because nothing else is permitted to take what it waits for; two
+        reservers holding partial sets deadlock each other.
+        """
+        for job in jobs:  # already oldest-first
+            if now - job.submitted_at < self.config.starvation_threshold_s:
+                continue
+            if matcher.rank_matches(job.requirements, free_by_agent):
+                continue  # it can run right now; it is not starving
+            return job
+        return None
+
+    def _mark_unsatisfiable(self, job: Job, now: float) -> None:
+        """Flag it, say so once, and KEEP IT QUEUED — fleets get repaired."""
+        if self.store.set_blocked_reason(job.id, BLOCKED_NO_CAPABLE_AGENT, now=now):
+            log.warning("%s cannot run on this fleet as it stands: no capable bench", job.id)
+        expired = now - job.submitted_at > self.config.unsatisfiable_timeout_s
+        if expired and self.store.dead_letter_unsatisfiable(job.id, now=now):
+            log.warning("%s dead-lettered: no capable bench appeared", job.id)
+
+    def _clear_unsatisfiable(self, job: Job) -> None:
+        if job.blocked_reason == BLOCKED_NO_CAPABLE_AGENT:
+            self.store.set_blocked_reason(job.id, None)
+
+    def reservation_for(self, job_id: str) -> Reservation | None:
+        reservation = self.reservation
+        return reservation if reservation and reservation.job_id == job_id else None
 
     # ------------------------------------------------------------- wakeups
     def notify(self) -> None:

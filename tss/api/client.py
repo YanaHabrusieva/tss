@@ -14,7 +14,8 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from tss.api.deps import get_directives, get_scheduler, get_store
+from tss.api.deps import get_config, get_directives, get_scheduler, get_store
+from tss.core.config import Config
 from tss.core.directives import DirectiveQueue
 from tss.core.models import CapabilitySpec, FleetView, Job, JobState
 from tss.core.scheduler import Scheduler
@@ -25,6 +26,7 @@ router = APIRouter(prefix="/v1", tags=["client"])
 StoreDep = Annotated[Store, Depends(get_store)]
 SchedulerDep = Annotated[Scheduler, Depends(get_scheduler)]
 DirectivesDep = Annotated[DirectiveQueue, Depends(get_directives)]
+ConfigDep = Annotated[Config, Depends(get_config)]
 
 
 class SubmitRequest(BaseModel):
@@ -43,6 +45,19 @@ class SubmitResponse(BaseModel):
     queue_position: int
 
 
+class ReservationView(BaseModel):
+    """Devices being withheld for this job. They are still `free` in the database
+    and owned by nobody — reserve is not claim (§3.4.1)."""
+
+    agent_id: str
+    resource_ids: list[str] = Field(default_factory=list)
+    since: float
+
+
+class JobStatus(Job):
+    reserving: ReservationView | None = None
+
+
 class QueueEntry(BaseModel):
     job_id: str
     name: str
@@ -57,6 +72,7 @@ class QueueEntry(BaseModel):
     attempt: int
     tried_agents: list[str] = Field(default_factory=list)
     blocked_reason: str | None = None
+    reserving_on: str | None = None
 
 
 class QueueView(BaseModel):
@@ -67,20 +83,19 @@ class QueueView(BaseModel):
 
 @router.post("/jobs", response_model=SubmitResponse, status_code=201)
 async def submit_job(
-    req: SubmitRequest, store: StoreDep, scheduler: SchedulerDep
+    req: SubmitRequest, store: StoreDep, scheduler: SchedulerDep, config: ConfigDep
 ) -> SubmitResponse:
     if not req.requirements:
         raise HTTPException(status_code=400, detail="a job must require at least one resource")
-    if len(req.requirements) > 1:
-        # Multi-device is off until step 5, where reservation and the invariant
-        # checker land together. Rejecting is honest; accepting and scheduling
-        # only the first requirement would be a silent partial allocation, which
-        # is the one thing this system exists to prevent.
+    if len(req.requirements) > config.max_resources_per_job:
+        # Matching is a backtracking search over specs x devices. It is trivial
+        # at the sizes real HIL tests use, and this bound keeps it that way
+        # rather than letting one absurd job pin a scheduler pass.
         raise HTTPException(
             status_code=400,
             detail=(
-                "multi-device jobs are not enabled yet (step 5): "
-                f"got {len(req.requirements)} requirements, expected 1"
+                f"a job may require at most {config.max_resources_per_job} devices; "
+                f"got {len(req.requirements)}"
             ),
         )
 
@@ -98,12 +113,31 @@ async def submit_job(
     return SubmitResponse(job_id=job_id, queue_position=store.queue_position(job_id))
 
 
-@router.get("/jobs/{job_id}")
-async def get_job(job_id: str, store: StoreDep) -> Job:
+@router.get("/jobs/{job_id}", response_model=JobStatus)
+async def get_job(job_id: str, store: StoreDep, scheduler: SchedulerDep) -> JobStatus:
+    """A job, plus why it is not moving.
+
+    `blocked_reason` and `reserving` are the two answers to "why am I waiting"
+    that are genuinely non-obvious once jobs need several devices — and the
+    second one lives only in scheduler memory, because a reservation
+    deliberately leaves no trace in the database (§3.4.1).
+    """
     job = store.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"unknown job {job_id}")
-    return job
+    reservation = scheduler.reservation_for(job_id)
+    return JobStatus(
+        **job.model_dump(),
+        reserving=(
+            None
+            if reservation is None
+            else ReservationView(
+                agent_id=reservation.agent_id,
+                resource_ids=sorted(reservation.resource_ids),
+                since=reservation.since,
+            )
+        ),
+    )
 
 
 @router.delete("/jobs/{job_id}")
@@ -139,7 +173,7 @@ async def cancel_job(
 
 
 @router.get("/queue", response_model=QueueView)
-async def queue(store: StoreDep) -> QueueView:
+async def queue(store: StoreDep, scheduler: SchedulerDep) -> QueueView:
     """Queued and running jobs with wait times (§3.9).
 
     Elapsed-versus-budget is shown; an estimated start time is not. A confident
@@ -163,6 +197,9 @@ async def queue(store: StoreDep) -> QueueView:
             attempt=job.attempt,
             tried_agents=job.tried_agents,
             blocked_reason=job.blocked_reason,
+            reserving_on=(
+                r.agent_id if (r := scheduler.reservation_for(job.id)) is not None else None
+            ),
         )
         if job.state == JobState.QUEUED:
             view.queued.append(entry)

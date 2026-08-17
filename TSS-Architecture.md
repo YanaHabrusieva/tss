@@ -349,6 +349,27 @@ requirements as a list of tag-subsets rather than a product string is what lets 
 test actually needs. MeteorShower already needs platform **and** fixture product **and** bezel colour;
 a flat string was never going to hold.
 
+**Assignment must be exact, not greedy — and the reason is user-visible.** Matching N specs to M
+devices is maximum bipartite matching. Greedy assignment in LRU order is exact at N=1 and wrong at
+N>1 whenever specs overlap:
+
+```
+devices  vg-01 {harness: j1939}      vg-02 {harness: obd2}
+
+specs [{harness: j1939}, {product: vehicle_gateway}]   greedy → vg-01, vg-02   ✓
+specs [{product: vehicle_gateway}, {harness: j1939}]   greedy → NO MATCH       ✗
+```
+
+Same job, same fleet, different answer — because the permissive spec goes first and consumes the only
+device the restrictive one could have used. **The bug isn't that greedy is suboptimal; it's that
+whether a job runs depends on the order an engineer happened to type its requirements.** That is not
+something a user has any reason to think matters, which makes it the kind of behaviour that gets
+reported as "the scheduler is flaky."
+
+Plain recursive backtracking over an LRU-sorted pool fixes it and keeps LRU preference (the first
+assignment found is still the least-recently-used one). At HIL sizes there is no reason to reach for
+Hopcroft–Karp; bound the input instead (§7.1) so a pathological job can't pin a scheduling pass.
+
 **Why LRU and not first-fit.** First-fit sends every job to the same device while its siblings idle.
 That unit's hardware wears out first, and — worse — if it is subtly broken, every job fails and you
 conclude the *firmware* is broken. LRU spreads load and makes a single bad device show up as "one
@@ -1072,6 +1093,7 @@ on day one is free; retrofitting it is not.
 | `MAX_DISTINCT_AGENTS` | 3 | Distinct **benches** tried before a job is called poison |
 | `QUARANTINE_THRESHOLD` | 3 | Consecutive failures — on one resource → quarantine the device; spanning ≥2 resources → quarantine the machine |
 | `STARVATION_THRESHOLD` | 60s | After this, the oldest unsatisfiable job becomes the sole reserver (§3.4.1) |
+| `MAX_RESOURCES_PER_JOB` | 8 | Rejected at the API with 400. Backtracking is trivial at HIL sizes but exponential in the worst case; this is a **liveness** bound, not a correctness one — it stops one absurd job pinning a scheduling pass for the whole fleet |
 | `UNSATISFIABLE_TIMEOUT` | 30 min | A job no bench *could ever* satisfy stays queued this long (fleets get repaired), then dead-letters rather than clogging the queue forever |
 
 **Show the arithmetic on `flaky_network`.** At a 30% heartbeat drop rate and a TTL of 4 beats, a false

@@ -247,10 +247,9 @@ def test_completing_frees_every_device_the_job_held(dispatch_server, db_path):
     store.close()
 
 
-def test_a_multi_device_job_is_rejected_rather_than_half_supported(dispatch_server):
-    """Multi-device lands in step 5 with reservation and the invariant checker.
-    Accepting the job and scheduling only its first requirement would be a silent
-    partial allocation — the one thing this system exists to prevent."""
+def test_a_multi_device_job_is_accepted_and_counted(dispatch_server):
+    """Multi-device is on (step 5a): `resource_count` is len(requirements), and
+    the job is queued rather than refused."""
     base, _config = dispatch_server
 
     async def scenario():
@@ -260,16 +259,43 @@ def test_a_multi_device_job_is_rejected_rather_than_half_supported(dispatch_serv
                 json={
                     "name": "gateway-to-gateway",
                     "requirements": [
-                        {"product": "vehicle_gateway"},
+                        {"product": "vehicle_gateway", "harness": "j1939"},
                         {"product": "asset_gateway"},
                     ],
                 },
             )
+            assert two.status_code == 201, two.text
+            job = (await client.get(f"/v1/jobs/{two.json()['job_id']}")).json()
+            return job
+
+    job = asyncio.run(scenario())
+
+    assert job["resource_count"] == 2
+    assert job["state"] == "queued"
+    assert len(job["requirements"]) == 2
+    assert job["reserving"] is None, "not starving yet"
+
+
+def test_a_job_asking_for_absurdly_many_devices_is_refused(dispatch_server):
+    """Matching is a backtracking search; the bound keeps one silly job from
+    pinning a scheduling pass. An empty requirement list is refused too."""
+    base, config = dispatch_server
+
+    async def scenario():
+        async with httpx.AsyncClient(base_url=base, timeout=10.0) as client:
+            too_many = await client.post(
+                "/v1/jobs",
+                json={
+                    "name": "greedy",
+                    "requirements": [{"product": "vehicle_gateway"}]
+                    * (config.max_resources_per_job + 1),
+                },
+            )
             none = await client.post("/v1/jobs", json={"name": "nothing", "requirements": []})
-            return two, none
+            return too_many, none
 
-    two, none = asyncio.run(scenario())
+    too_many, none = asyncio.run(scenario())
 
-    assert two.status_code == 400
-    assert "not enabled yet" in two.json()["detail"]
+    assert too_many.status_code == 400
+    assert "at most" in too_many.json()["detail"]
     assert none.status_code == 400

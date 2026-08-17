@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 
+from tss.core import matcher
 from tss.core.models import TERMINAL_JOB_STATES, AgentState, ResourceState
 from tss.core.store import Store
 
@@ -153,12 +154,78 @@ def check_i7(store: Store) -> list[str]:
     return violations
 
 
+def check_i9(scheduler) -> list[str]:
+    """At most one job reserves; its reservations are all on one FEASIBLE agent;
+    and no reserved resource is claimed by another job.
+
+    Checked against SCHEDULER STATE, not the database — unlike every other check
+    in this file — because a reservation deliberately leaves no database trace
+    (§3.4.1). That is the whole point: a reserved device is still `free` and
+    owned by nobody, so there is nothing in the DB to inspect.
+
+    Every clause is a bug someone would otherwise ship:
+
+      one reserver          two reservers holding partial sets deadlock in
+                            bookkeeping, exactly as two jobs holding partial
+                            hardware deadlock in §7.5
+      one feasible agent    reservations spread across benches idle devices
+                            toward a set that can never be assembled, because
+                            allocation is single-bench
+      not claimed           the reservation is only real if the claim path
+                            actually respects it
+    """
+    reservation = getattr(scheduler, "reservation", None)
+    if reservation is None:
+        return []
+
+    violations = []
+    store = scheduler.store
+    job = store.get_job(reservation.job_id)
+    if job is None or job.state != "queued":
+        violations.append(
+            f"I9: reserving for {reservation.job_id}, which is "
+            f"{'gone' if job is None else job.state} — a reservation outlived its job"
+        )
+
+    resources = {r.id: r for r in store.list_resources()}
+    for resource_id in sorted(reservation.resource_ids):
+        resource = resources.get(resource_id)
+        if resource is None:
+            violations.append(f"I9: reserved {resource_id} does not exist")
+            continue
+        if resource.agent_id != reservation.agent_id:
+            violations.append(
+                f"I9: reserved {resource_id} is on {resource.agent_id}, "
+                f"but the reservation targets {reservation.agent_id}"
+            )
+        # RESERVE IS NOT CLAIM. A reserved device must still be free and unowned;
+        # anything else means the reservation took hardware, which is the partial
+        # hold this design exists to prevent.
+        if resource.state != ResourceState.FREE:
+            violations.append(f"I9: reserved {resource_id} is {resource.state}, not free")
+        if resource.current_job_id is not None:
+            violations.append(f"I9: reserved {resource_id} is claimed by {resource.current_job_id}")
+
+    if job is not None:
+        inventory = [r for r in resources.values() if r.agent_id == reservation.agent_id]
+        if not matcher.could_ever_satisfy(job.requirements, inventory):
+            violations.append(
+                f"I9: reserving on {reservation.agent_id}, which could never satisfy "
+                f"{job.id} — those devices idle forever, for nothing"
+            )
+    return violations
+
+
 #: Every DB-checkable invariant, for the chaos watchdog and for tests.
 DB_CHECKS = (check_i2, check_i5, check_i6, check_i7, check_i8)
 
 
-def check_all(store: Store) -> list[str]:
+def check_all(store: Store, scheduler=None) -> list[str]:
+    """Every invariant this process can check. Pass the scheduler to include I9,
+    which lives in memory rather than in the database."""
     violations: list[str] = []
     for check in DB_CHECKS:
         violations.extend(check(store))
+    if scheduler is not None:
+        violations.extend(check_i9(scheduler))
     return violations

@@ -102,41 +102,76 @@ def match_on_agent(
     Each spec consumes a DISTINCT resource — a job needing two vehicle gateways
     must get two devices, not the same one twice.
 
-    WHAT THIS APPROXIMATES: **maximum bipartite matching** between requirement
-    specs and free devices. The greedy walk below is exact at N=1, which is all
-    the API currently accepts. At N>1 it can fail where a perfect matching
-    exists, whenever two specs overlap on the same devices:
+    THIS IS **maximum bipartite matching** between requirement specs and free
+    devices, and greedy is not an algorithm for it. Greedy is exact at N=1 and
+    wrong as soon as two specs overlap on the same devices:
 
         specs   [{product: vg}, {product: vg, harness: j1939}]
         devices vg-01 {harness: j1939}   vg-02 {harness: obd2}
 
-    Greedy hands vg-01 to the first spec (it matches, and it may sort first by
-    LRU), then finds nothing for the second — and reports "no match" for a job
-    that vg-01 + vg-02 could have run. That is a job left queued in front of
-    hardware that could run it, which is the utilization failure the whole
-    two-level model exists to avoid.
+    Greedy hands vg-01 to the permissive spec (it matches, and it sorts first by
+    LRU), finds nothing left with a j1939 harness, and reports no match — for a
+    job vg-02 + vg-01 satisfies exactly. Worse, the *reverse* spec order works,
+    so whether the job runs depends on the order an engineer happened to type its
+    requirements. A job left queued in front of hardware that could run it is the
+    utilization failure the whole two-level model exists to prevent.
 
-    At N <= 4 devices per job, plain backtracking is enough and Hopcroft-Karp is
-    not worth the code. Step 5 turns multi-device on; this is what to reach for
-    then. Leaving it greedy until then keeps the exact case exact rather than
-    half-building the general one.
+    Backtracking below, deliberately plain: at N <= 4 devices per job the search
+    is a handful of comparisons, and Hopcroft-Karp would be more code than the
+    problem deserves. The pool stays LRU-sorted, so the first assignment found is
+    still the least-recently-used one (§3.4).
     """
     pool = offerable(resources)
     if not co_located(pool):
         return None
     pool.sort(key=lru_key)
 
-    chosen: list[Resource] = []
-    taken: set[str] = set()
-    for spec in requirements:
-        for candidate in pool:
-            if candidate.id not in taken and satisfies(candidate, spec):
-                chosen.append(candidate)
-                taken.add(candidate.id)
-                break
-        else:
-            return None
+    chosen = _assign(list(requirements), pool, set())
+    if chosen is None:
+        return None
     return Match(agent_id=chosen[0].agent_id, resources=tuple(chosen))
+
+
+def _assign(
+    specs: list[CapabilitySpec], pool: list[Resource], taken: set[str]
+) -> list[Resource] | None:
+    """Assign every spec a distinct resource, or return None if it cannot be done.
+
+    Depth-first over an LRU-ordered pool: the first complete assignment found is
+    the one that prefers the longest-idle devices, and backing out only happens
+    when a later spec has been left with nothing.
+    """
+    if not specs:
+        return []
+    spec, rest = specs[0], specs[1:]
+    for candidate in pool:
+        if candidate.id in taken or not satisfies(candidate, spec):
+            continue
+        taken.add(candidate.id)
+        tail = _assign(rest, pool, taken)
+        if tail is not None:
+            return [candidate, *tail]
+        taken.discard(candidate.id)  # that choice starved a later spec; try another
+    return None
+
+
+def could_ever_satisfy(
+    requirements: Sequence[CapabilitySpec], resources: Sequence[Resource]
+) -> bool:
+    """The feasibility filter (§3.4.1 step 1) — the step that is easy to skip.
+
+    Could this bench EVER run this job, ignoring what is free right now? A bench
+    with two healthy vehicle gateways can never run a 3-VG job, however long you
+    wait; reserving a device there idles it forever, for nothing.
+
+    Same assignment logic as matching, run over installed inventory instead of
+    free devices — so "three devices, but two of them obd2" is correctly judged
+    infeasible for a job needing two j1939s, which counting devices would miss.
+    """
+    pool = installed(resources)
+    if not co_located(pool):
+        return False
+    return _assign(list(requirements), sorted(pool, key=lru_key), set()) is not None
 
 
 def rank_matches(

@@ -417,7 +417,13 @@ claim, which strands devices with no owner and no lease to expire them.
 > **3. Reserve only on the target.** Free matching resources on that agent are withheld from other jobs.
 > Everything on every other bench keeps flowing normally.
 >
-> **At most one job reserves at a time** — always the oldest starving one. The target is recomputed each
+> **At most one job reserves at a time** — always the oldest **feasible** starving one. Feasibility
+> assessment is a different thing and is **per job**: every starving job gets checked, flagged
+> `no_capable_agent` if nothing could ever run it, and starts its dead-letter clock. Tying assessment
+> to the reserver — which is how an earlier draft read — means a younger unsatisfiable job behind an
+> older starving one is never flagged, never starts its clock, and sits queued forever; and an
+> unsatisfiable job that happens to be *oldest* would suppress reservation for everyone behind it
+> until it dead-letters. Assess all; reserve one. The target is recomputed each
 > pass, so it follows the fleet: if another bench frees a full set first, the job takes that instead.
 > Reservation never prevents a job from claiming a set it can actually get.
 

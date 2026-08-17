@@ -11,9 +11,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from tss.api import agent, client
+from tss.api import agent, client, ws
 from tss.core.config import Config
 from tss.core.directives import DirectiveQueue
+from tss.core.events import EventBus
 from tss.core.reaper import Reaper
 from tss.core.scheduler import Scheduler
 from tss.core.store import Store
@@ -28,10 +29,15 @@ def create_app(config: Config | None = None, store: Store | None = None) -> Fast
     scheduler = Scheduler(store, config)
     # A queued directive releases the agent's long-poll immediately.
     directives = DirectiveQueue(on_push=scheduler.wake_agent)
+    bus = EventBus()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store.init_schema()
+        # Bound here, not at construction: this is the loop the subscribers will
+        # live on, and publishers reach it from other threads.
+        bus.bind()
+        store.publish = bus.publish_all
         reaper = Reaper(store, config, on_reap=scheduler.notify, directives=directives)
         app.state.reaper = reaper
         reaper.start()
@@ -40,6 +46,7 @@ def create_app(config: Config | None = None, store: Store | None = None) -> Fast
         try:
             yield
         finally:
+            store.publish = None
             await scheduler.stop()
             await reaper.stop()
             store.close()
@@ -49,9 +56,11 @@ def create_app(config: Config | None = None, store: Store | None = None) -> Fast
     app.state.config = config
     app.state.scheduler = scheduler
     app.state.directives = directives
+    app.state.bus = bus
     app.include_router(agent.router)
     app.include_router(agent.job_router)
     app.include_router(client.router)
+    app.include_router(ws.router)
     return app
 
 

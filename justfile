@@ -46,7 +46,23 @@ agent ID="bench-sf-01" DEVICES="3":
 
 # Benches and their devices.
 fleet:
-    {{py}} -m tss.cli.main fleet
+    @{{py}} -m tss.cli.main fleet
+
+# What is running and what is waiting.
+queue:
+    @{{py}} -m tss.cli.main queue
+
+# The live view. This is the one to have on screen.
+watch:
+    @{{py}} -m tss.cli.main watch
+
+# Why is that job not running yet?
+why JOB:
+    @{{py}} -m tss.cli.main why {{JOB}}
+
+# Submit a job: `just submit smoke` or `just submit gw2gw 2`.
+submit NAME="smoke" DEVICES="1" DURATION="10":
+    @{{py}} -c "import json,sys,urllib.request as u;         reqs=[{'product':'vehicle_gateway'}]*int('{{DEVICES}}');         body=json.dumps({'name':'{{NAME}}','requirements':reqs,'payload':{'duration_s':float('{{DURATION}}')}}).encode();         r=u.Request('http://127.0.0.1:8000/v1/jobs',data=body,headers={'content-type':'application/json'});         print(u.urlopen(r).read().decode())"
 
 # THE MERGE GATE: 15 agents x 2-4 devices, 100 jobs at 30% multi-device, 5 seeds.
 # Zero invariant violations, or the build fails.

@@ -23,7 +23,7 @@ import json
 import sqlite3
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from tss.core.config import DEFAULT, Config
@@ -209,6 +209,9 @@ class Store:
         self.path = str(path)
         self.config = config
         self._local = threading.local()
+        #: Where committed events go for live subscribers (§3.6). Set by the app;
+        #: None in tests and in the chaos checker's read-only connections.
+        self.publish: Callable[[list[Event]], None] | None = None
 
     # ------------------------------------------------------------------ setup
     @property
@@ -382,7 +385,7 @@ class Store:
                 job_id=job_id,
                 detail={"epoch": epoch, "resource_ids": ordered},
             )
-            conn.execute("COMMIT")
+            self._commit(conn)
         except sqlite3.OperationalError as exc:
             self._rollback(conn)
             if not _is_busy(exc):
@@ -417,10 +420,24 @@ class Store:
             return REASON_RESOURCE_COUNT_MISMATCH
         return REASON_JOB_NOT_QUEUED
 
-    @staticmethod
-    def _rollback(conn: sqlite3.Connection) -> None:
+    def _pending_events(self) -> list[Event]:
+        pending = getattr(self._local, "pending_events", None)
+        if pending is None:
+            pending = []
+            self._local.pending_events = pending
+        return pending
+
+    def _commit(self, conn: sqlite3.Connection) -> None:
+        """Commit, THEN publish. Never the other way round (§3.6)."""
+        conn.execute("COMMIT")
+        published, self._local.pending_events = self._pending_events(), []
+        if published and self.publish is not None:
+            self.publish(published)
+
+    def _rollback(self, conn: sqlite3.Connection) -> None:
         # "cannot rollback - no transaction is active" means the driver already
         # unwound it; anything else here would mask the error we are unwinding for.
+        self._local.pending_events = []  # nothing happened, so nothing is announced
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute("ROLLBACK")
 
@@ -521,7 +538,7 @@ class Store:
                     "agent_version": agent_version,
                 },
             )
-            conn.execute("COMMIT")
+            self._commit(conn)
         except BaseException:
             self._rollback(conn)
             raise
@@ -783,7 +800,7 @@ class Store:
             # Blame AFTER the release: quarantining a device means moving it out
             # of `free`, and doing that first would only have it freed back.
             self._attribute_failure(conn, agent_id, held, outcome=outcome, now=now)
-            conn.execute("COMMIT")
+            self._commit(conn)
         except BaseException:
             self._rollback(conn)
             raise
@@ -986,7 +1003,7 @@ class Store:
                     "freed_resources": [local_of(r) for r in freed],
                 },
             )
-            conn.execute("COMMIT")
+            self._commit(conn)
         except BaseException:
             self._rollback(conn)
             raise
@@ -1078,7 +1095,7 @@ class Store:
                     WHERE current_job_id = :job_id AND state = 'busy'""",
                 {"job_id": job_id},
             )
-            conn.execute("COMMIT")
+            self._commit(conn)
         except BaseException:
             self._rollback(conn)
             raise
@@ -1144,7 +1161,7 @@ class Store:
                 job_id=job_id,
                 detail={"reason": BLOCKED_NO_CAPABLE_AGENT},
             )
-            conn.execute("COMMIT")
+            self._commit(conn)
         except BaseException:
             self._rollback(conn)
             raise
@@ -1204,7 +1221,7 @@ class Store:
                 job_id=job_id,
                 detail={"was_running": was_running},
             )
-            conn.execute("COMMIT")
+            self._commit(conn)
         except BaseException:
             self._rollback(conn)
             raise
@@ -1419,9 +1436,13 @@ class Store:
             job_id=job_id,
             detail=detail,
         )
+        # Autocommit: the row is already durable, so this is "after commit" too.
+        published, self._local.pending_events = self._pending_events(), []
+        if published and self.publish is not None:
+            self.publish(published)
 
-    @staticmethod
     def _insert_event(
+        self,
         conn: sqlite3.Connection,
         *,
         kind: str,
@@ -1441,6 +1462,19 @@ class Store:
                 "job_id": job_id,
                 "detail": json.dumps(detail) if detail is not None else None,
             },
+        )
+        # Held back until COMMIT. Publishing here would announce a state change
+        # that a rollback may yet undo, and the live stream would then disagree
+        # with the audit log — which is the one thing §3.6 rules out.
+        self._pending_events().append(
+            Event(
+                ts=ts,
+                kind=kind,
+                agent_id=agent_id,
+                resource_id=resource_id,
+                job_id=job_id,
+                detail=detail,
+            )
         )
 
     # ------------------------------------------------------------------- reads

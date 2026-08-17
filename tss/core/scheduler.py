@@ -170,24 +170,32 @@ class Scheduler:
         dead-lettered simply is not the oldest starving job any more, so nothing
         is withheld on the very next pass.
         """
-        starving = self._oldest_starving_job(jobs, free_by_agent, now)
+        starving = None
+        feasible: dict[str, list[Resource]] = {}
+        # Every starving job is assessed, not just the one that ends up
+        # reserving. An unsatisfiable job that happens to be younger than another
+        # starving job would otherwise never be flagged and never dead-letter —
+        # it would simply sit there, which is the failure mode §3.4.1 is about.
+        for job in self._starving_jobs(jobs, free_by_agent, now):
+            # STEP 1 — feasibility. Only benches whose total installed inventory
+            # could ever satisfy this job, ignoring what is free right now.
+            candidates = {
+                agent_id: pool
+                for agent_id, pool in installed_by_agent.items()
+                if matcher.could_ever_satisfy(job.requirements, pool)
+            }
+            if not candidates:
+                # Nothing to reserve TOWARD. Reserving here would idle devices
+                # forever for a job no bench can run, and from the outside that
+                # is indistinguishable from a broken scheduler.
+                self._mark_unsatisfiable(job, now)
+                continue
+            self._clear_unsatisfiable(job)
+            if starving is None:
+                # The oldest starving job that something could actually run.
+                starving, feasible = job, candidates
         if starving is None:
             return None
-
-        # STEP 1 — feasibility. Only benches whose total installed inventory
-        # could ever satisfy this job, ignoring what is free right now.
-        feasible = {
-            agent_id: pool
-            for agent_id, pool in installed_by_agent.items()
-            if matcher.could_ever_satisfy(starving.requirements, pool)
-        }
-        if not feasible:
-            # Nothing to reserve TOWARD. Reserving here would idle devices
-            # forever for a job no bench can run, and from the outside that is
-            # indistinguishable from a broken scheduler (§3.4.1).
-            self._mark_unsatisfiable(starving, now)
-            return None
-        self._clear_unsatisfiable(starving)
 
         # STEP 2 — pick exactly ONE target: closest to satisfying the job (most
         # matching devices already free), tie-broken on fewest busy. Reserving
@@ -221,22 +229,23 @@ class Scheduler:
             log.info("%s is starving; reserving on %s", starving.id, target)
         return Reservation(job_id=starving.id, agent_id=target, resource_ids=held, since=since)
 
-    def _oldest_starving_job(
+    def _starving_jobs(
         self, jobs: list[Job], free_by_agent: dict[str, list[Resource]], now: float
-    ) -> Job | None:
-        """The oldest queued job that has waited too long AND cannot run now.
+    ) -> list[Job]:
+        """Queued jobs that have waited too long AND cannot run right now.
 
-        At most one, always the oldest. One reserver can eventually be satisfied
-        because nothing else is permitted to take what it waits for; two
-        reservers holding partial sets deadlock each other.
+        Oldest first. Only one of these ever reserves — one reserver can always
+        eventually be satisfied, because nothing else is permitted to take what
+        it waits for, whereas two reservers holding partial sets deadlock each
+        other in bookkeeping. The rest are here only so their feasibility gets
+        assessed.
         """
-        for job in jobs:  # already oldest-first
-            if now - job.submitted_at < self.config.starvation_threshold_s:
-                continue
-            if matcher.rank_matches(job.requirements, free_by_agent):
-                continue  # it can run right now; it is not starving
-            return job
-        return None
+        return [
+            job
+            for job in jobs  # already oldest-first
+            if now - job.submitted_at >= self.config.starvation_threshold_s
+            and not matcher.rank_matches(job.requirements, free_by_agent)
+        ]
 
     def _mark_unsatisfiable(self, job: Job, now: float) -> None:
         """Flag it, say so once, and KEEP IT QUEUED — fleets get repaired."""

@@ -35,6 +35,7 @@ T0 = 1_000_000.0
 VG = {"product": "vehicle_gateway", "harness": "j1939"}
 OBD2 = {"product": "vehicle_gateway", "harness": "obd2"}
 ANY_VG = {"product": "vehicle_gateway"}
+AG = {"product": "asset_gateway"}  # no bench in these tests has one
 
 
 @pytest.fixture
@@ -258,6 +259,63 @@ def test_a_job_no_bench_could_ever_run_reserves_nothing(store, scheduler, config
     # Said once, not once per pass.
     tick(scheduler, store, T0 + STARVED + 1)
     assert len(store.events(job_id="job-impossible")) == 1
+
+
+def test_an_impossible_job_at_the_head_does_not_suppress_reservation_behind_it(
+    store, scheduler, config
+):
+    """ASSESS ALL, RESERVE ONE.
+
+    Feasibility is assessed for every starving job; reservation stays exclusive
+    to the oldest FEASIBLE one. Tie the assessment to "the job about to reserve"
+    instead and an impossible job at the head of the queue quietly suppresses
+    reservation for everything behind it — the big jobs never get their bench,
+    and the impossible one is never even flagged.
+    """
+    devices = bench(store, "bench-01", devices=2)
+    occupy(store, "bench-01", devices[:1])
+    # Oldest, and nobody in the fleet has an asset gateway at all.
+    submit(store, "job-impossible", 2, at=T0, caps=AG)
+    submit(store, "job-big", 2, at=T0 + 1)
+
+    tick(scheduler, store, T0 + STARVED)
+
+    assert scheduler.reservation is not None, "the feasible job behind it must still reserve"
+    assert scheduler.reservation.job_id == "job-big"
+    assert scheduler.reservation.agent_id == "bench-01"
+    assert scheduler.reservation_for("job-impossible") is None, "there is nothing to reserve toward"
+
+    impossible = store.get_job("job-impossible")
+    assert impossible.state == JobState.QUEUED
+    assert impossible.blocked_reason == BLOCKED_NO_CAPABLE_AGENT, (
+        "the head job must still be assessed, or it never starts its dead-letter clock"
+    )
+    assert store.get_job("job-big").blocked_reason is None
+    assert check_all(store, scheduler) == []
+
+
+def test_the_impossible_job_dead_letters_on_its_own_clock_while_the_other_still_reserves(
+    store, scheduler, config
+):
+    """Its 30-minute clock runs from ITS submission, independently of whatever is
+    reserving. The two jobs do not share a fate."""
+    devices = bench(store, "bench-01", devices=2)
+    occupy(store, "bench-01", devices[:1])
+    submit(store, "job-impossible", 2, at=T0, caps=AG)
+    submit(store, "job-big", 2, at=T0 + 1)
+    tick(scheduler, store, T0 + STARVED)
+
+    tick(scheduler, store, T0 + config.unsatisfiable_timeout_s + 1)
+
+    impossible = store.get_job("job-impossible")
+    assert impossible.state == JobState.DEAD_LETTER
+    assert impossible.outcome == Outcome.INFRA_ERROR
+    assert impossible.result_detail.startswith(BLOCKED_NO_CAPABLE_AGENT)
+    # ...and the job behind it is unaffected: still queued, still reserving.
+    assert store.get_job("job-big").state == JobState.QUEUED
+    assert scheduler.reservation is not None
+    assert scheduler.reservation.job_id == "job-big"
+    assert check_all(store, scheduler) == []
 
 
 def test_an_unsatisfiable_job_runs_once_the_fleet_is_repaired(store, scheduler, config):

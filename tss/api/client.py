@@ -15,9 +15,19 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from tss.api.deps import get_config, get_directives, get_scheduler, get_store
+from tss.core import matcher
 from tss.core.config import Config
 from tss.core.directives import DirectiveQueue
-from tss.core.models import CapabilitySpec, FleetView, Job, JobState
+from tss.core.models import (
+    AgentState,
+    CapabilitySpec,
+    FleetView,
+    Job,
+    JobState,
+    Outcome,
+    ResourceState,
+    local_of,
+)
 from tss.core.scheduler import Scheduler
 from tss.core.store import Store
 
@@ -172,17 +182,18 @@ async def cancel_job(
     return {"cancelled": True, "job_id": job_id, "was_running": result == "cancelled_running"}
 
 
-@router.get("/queue", response_model=QueueView)
-async def queue(store: StoreDep, scheduler: SchedulerDep) -> QueueView:
+def queue_view(store: Store, scheduler: Scheduler) -> QueueView:
     """Queued and running jobs with wait times (§3.9).
 
     Elapsed-versus-budget is shown; an estimated start time is not. A confident
     "starts in ~3m" would be a lie without historical duration data, which the
-    POC does not have (§13.6).
+    POC deliberately does not collect (§13.7) — and a number you cannot support
+    is exactly the thing that gets pulled on.
     """
     now = time.time()
     view = QueueView(now=now)
     for job in store.jobs_in_flight():
+        reservation = scheduler.reservation_for(job.id)
         entry = QueueEntry(
             job_id=job.id,
             name=job.name,
@@ -197,15 +208,191 @@ async def queue(store: StoreDep, scheduler: SchedulerDep) -> QueueView:
             attempt=job.attempt,
             tried_agents=job.tried_agents,
             blocked_reason=job.blocked_reason,
-            reserving_on=(
-                r.agent_id if (r := scheduler.reservation_for(job.id)) is not None else None
-            ),
+            reserving_on=reservation.agent_id if reservation else None,
         )
         if job.state == JobState.QUEUED:
             view.queued.append(entry)
         else:
             view.running.append(entry)
     return view
+
+
+@router.get("/queue", response_model=QueueView)
+async def queue(store: StoreDep, scheduler: SchedulerDep) -> QueueView:
+    return queue_view(store, scheduler)
+
+
+class DeviceLine(BaseModel):
+    local_id: str
+    state: ResourceState
+    matches: bool
+    current_job_id: str | None = None
+    elapsed_s: float | None = None
+    budget_s: int | None = None
+    reserved_for_you: bool = False
+
+
+class BenchAssessment(BaseModel):
+    agent_id: str
+    agent_state: AgentState
+    feasible: bool
+    #: Why this bench can never satisfy the job, in words. Named for the human
+    #: reading it, not for the matcher.
+    why_not: str | None = None
+    devices: list[DeviceLine] = Field(default_factory=list)
+
+
+class WhyView(BaseModel):
+    job_id: str
+    name: str
+    state: JobState
+    waited_s: float
+    requirements: list[CapabilitySpec]
+    resource_count: int
+    blocked_reason: str | None = None
+    reserving: ReservationView | None = None
+    agent_id: str | None = None
+    elapsed_s: float | None = None
+    max_duration_s: int = 600
+    outcome: Outcome | None = None
+    result_detail: str | None = None
+    attempt: int = 0
+    tried_agents: list[str] = Field(default_factory=list)
+    feasible: list[BenchAssessment] = Field(default_factory=list)
+    infeasible: list[BenchAssessment] = Field(default_factory=list)
+    waiting_on: str | None = None
+
+
+@router.get("/jobs/{job_id}/why", response_model=WhyView)
+async def why(job_id: str, store: StoreDep, scheduler: SchedulerDep) -> WhyView:
+    """ "Why is my test stuck?" — answered in the tool (§3.9).
+
+    The number-one support question for any shared-hardware system, and the
+    default answer is a Slack message to whoever owns the fleet. On a
+    multi-device fleet it also removes a category of FALSE bug report: "the
+    scheduler is broken, there are free VGs and my job isn't running" is, nine
+    times out of ten, the reservation logic working exactly as designed.
+
+    Everything here is something TSS actually knows. Elapsed-versus-budget, yes;
+    an estimated start time, no — that needs duration history this POC does not
+    keep (§13.7).
+    """
+    job = store.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"unknown job {job_id}")
+
+    now = time.time()
+    reservation = scheduler.reservation_for(job_id)
+    reserved_ids = set(reservation.resource_ids) if reservation else set()
+    view = WhyView(
+        job_id=job.id,
+        name=job.name,
+        state=job.state,
+        waited_s=max(0.0, (job.assigned_at or now) - job.submitted_at),
+        requirements=job.requirements,
+        resource_count=job.resource_count,
+        blocked_reason=job.blocked_reason,
+        agent_id=job.agent_id,
+        elapsed_s=None if job.started_at is None else max(0.0, now - job.started_at),
+        max_duration_s=job.max_duration_s,
+        outcome=job.outcome,
+        result_detail=job.result_detail,
+        attempt=job.attempt,
+        tried_agents=job.tried_agents,
+        reserving=(
+            None
+            if reservation is None
+            else ReservationView(
+                agent_id=reservation.agent_id,
+                resource_ids=sorted(reservation.resource_ids),
+                since=reservation.since,
+            )
+        ),
+    )
+    if job.is_terminal:
+        return view
+
+    by_agent: dict[str, list] = {}
+    for resource in store.list_resources():
+        by_agent.setdefault(resource.agent_id, []).append(resource)
+
+    soonest: tuple[float, str] | None = None
+    for agent in store.agents():
+        devices = by_agent.get(agent.id, [])
+        installed = matcher.installed(devices)
+        feasible = agent.state == AgentState.ONLINE and matcher.could_ever_satisfy(
+            job.requirements, devices
+        )
+        assessment = BenchAssessment(
+            agent_id=agent.id,
+            agent_state=agent.state,
+            feasible=feasible,
+            why_not=None if feasible else _why_not(agent, job, installed, devices),
+        )
+        for resource in sorted(devices, key=lambda r: r.id):
+            matches = any(matcher.satisfies(resource, spec) for spec in job.requirements)
+            if resource.state == ResourceState.RETIRED and not matches:
+                continue
+            holder = store.get_job(resource.current_job_id) if resource.current_job_id else None
+            elapsed = (
+                None if holder is None or holder.started_at is None else now - holder.started_at
+            )
+            assessment.devices.append(
+                DeviceLine(
+                    local_id=local_of(resource.id),
+                    state=resource.state,
+                    matches=matches,
+                    current_job_id=resource.current_job_id,
+                    elapsed_s=elapsed,
+                    budget_s=holder.max_duration_s if holder else None,
+                    reserved_for_you=resource.id in reserved_ids,
+                )
+            )
+            if feasible and matches and holder is not None and elapsed is not None:
+                remaining = holder.max_duration_s - elapsed
+                if soonest is None or remaining < soonest[0]:
+                    soonest = (remaining, f"{local_of(resource.id)} on {agent.id}")
+
+        (view.feasible if feasible else view.infeasible).append(assessment)
+
+    if job.state == JobState.QUEUED:
+        if not view.feasible:
+            view.waiting_on = "nothing — no bench in the fleet can run this"
+        elif soonest is not None:
+            view.waiting_on = (
+                f"{soonest[1]} to free (~{max(0, int(soonest[0]))}s of its budget left)"
+            )
+        else:
+            view.waiting_on = "the next scheduling pass"
+    return view
+
+
+def _why_not(agent, job, installed, devices) -> str:
+    """One sentence a human can act on."""
+    if agent.state == AgentState.OFFLINE:
+        return "OFFLINE — its presence lease expired"
+    if agent.state == AgentState.QUARANTINED:
+        stamp = (
+            f" since {time.strftime('%H:%M', time.localtime(agent.quarantined_at))}"
+            if (agent.quarantined_at)
+            else ""
+        )
+        return f"QUARANTINED{stamp} (repeated failures across its devices)"
+    if agent.state == AgentState.DRAINING:
+        return "DRAINING — finishing what it has, accepting nothing new"
+    matching = [r for r in installed if any(matcher.satisfies(r, s) for s in job.requirements)]
+    broken = [
+        r
+        for r in devices
+        if r.state in (ResourceState.UNHEALTHY, ResourceState.RETIRED)
+        and any(matcher.satisfies(r, s) for s in job.requirements)
+    ]
+    if len(matching) < job.resource_count:
+        detail = f"only {len(matching)} healthy matching device(s), needs {job.resource_count}"
+        if broken:
+            detail += f" — {', '.join(f'{local_of(r.id)} is {r.state}' for r in broken)}"
+        return detail
+    return "its devices cannot be assigned to these requirements together"
 
 
 @router.get("/fleet", response_model=FleetView)

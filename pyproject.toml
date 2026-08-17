@@ -9,6 +9,9 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.9",
     "rich>=13.9",
+    # Already present via uvicorn[standard] for the server side of WS /v1/events;
+    # declared explicitly because `tss watch` is a client of it too.
+    "websockets>=13",
 ]
 
 [project.optional-dependencies]

@@ -52,6 +52,9 @@ Any change that could violate one of these needs a test proving it doesn't.
 - **Reserving is not claiming.** A reservation leaves the resource `free` with no owner and lives in
   scheduler memory — never a DB write. It covers exactly one feasible target agent. If no agent is
   feasible, do not reserve: set `blocked_reason='no_capable_agent'` and emit an event.
+- Feasibility assessment is PER STARVING JOB — every one gets flagged and starts its dead-letter
+  clock. Reservation is exclusive to the oldest FEASIBLE starving job: an unsatisfiable job at the
+  head must not suppress reservation for the jobs behind it.
 - Co-location is ONE predicate in the matcher (`all candidate resources share an agent_id`), not an
   assumption spread through the claim, reaper, and reservation logic. It exists for physical and
   reliability reasons, **not** to prevent deadlock — all-or-nothing does that.

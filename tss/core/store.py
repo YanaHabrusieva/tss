@@ -80,6 +80,9 @@ _BUSY_ERRCODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
 #:   1  pre-guard: unstamped, and `outcome` still accepted 'dead_letter'
 #:   2  'dead_letter' removed from the outcome CHECK — it is a state, not an
 #:      outcome, and a dead letter's outcome is 'infra_error'
+#:   3  indexes on events(job_id) and events(kind, agent_id, seq) — the table is
+#:      append-only and unbounded, so the fleet view, the timeout sweep and I6
+#:      were scanning more of it every hour the service stayed up
 #:
 #: This is NOT a migration system and is not trying to be one; migrations are out
 #: of scope for the POC. It exists because the failure it prevents is silent:
@@ -87,7 +90,7 @@ _BUSY_ERRCODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
 #: they were, so a stale file goes on cheerfully accepting writes this build
 #: forbids, and the first sign of trouble is a report that quietly disagrees with
 #: the code. Refusing to open is loud, immediate, and one `rm` from fixed.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SchemaVersionError(RuntimeError):
@@ -169,6 +172,13 @@ CREATE TABLE IF NOT EXISTS events (            -- append-only audit log
     agent_id  TEXT, resource_id TEXT, job_id TEXT,
     detail    TEXT
 );
+-- This table is append-only and never pruned (retention is out of scope, README),
+-- so every unindexed scan of it degrades linearly for as long as the service
+-- runs. Three hot paths read it: `tss why` and the job views by job_id, the
+-- fleet view by (kind, agent_id) for the last agent.offline, and check_i6 the
+-- same way per terminal job — the last one on every pass of the chaos watchdog.
+CREATE INDEX IF NOT EXISTS idx_events_job ON events(job_id) WHERE job_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_kind_agent ON events(kind, agent_id, seq);
 """
 
 # The N-way claim, §3.3. Both guards are load-bearing; see claim_all().

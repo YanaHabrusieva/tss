@@ -301,9 +301,10 @@ def test_a_seeded_chaos_run_holds_every_invariant():
     assert report.unfinished == [], "I3: " + "\n".join(report.unfinished)
     assert report.jobs_submitted == 25
     assert report.safety_checks > 10, "the watchdog barely ran"
-    # ...and the chaos actually happened. A run where nothing broke proves nothing.
-    assert report.events.get("offline", 0) > 0, "no bench ever died"
-    assert report.events.get("requeued", 0) > 0, "no job was ever taken back"
+    # ...and the chaos actually happened. `ok` now carries the floors, so this is
+    # one assertion rather than a list someone has to remember to extend.
+    assert report.floors == [], "\n".join(report.floors)
+    assert report.ok, report.render()
 
 
 @pytest.mark.slow

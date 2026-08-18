@@ -27,6 +27,7 @@ import random
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import httpx
@@ -81,9 +82,72 @@ class RunReport:
     duration_s: float = 0.0
     notes: list[str] = field(default_factory=list)
 
+    #: What the run must have PRODUCED, not merely survived. Filled in from the
+    #: profiles actually in the fleet.
+    floors: list[str] = field(default_factory=list)
+
     @property
     def ok(self) -> bool:
-        return not self.violations and not self.unfinished
+        return not self.violations and not self.unfinished and not self.floors
+
+    def check_floors(self, profiles: Sequence) -> list[str]:
+        """Did the chaos actually happen?
+
+        Nothing above this line would notice if it had not. Neuter
+        `crash_probability` and every invariant still holds, every job still
+        finishes, and the gate goes green — because "nothing broke" is trivially
+        true of a fleet where nothing was broken. A run that dead-lettered all
+        100 jobs also satisfies I3 and every safety check.
+
+        So the floors are per profile PRESENT IN THIS FLEET: a `--profile zombie`
+        run must not be asked to produce crashes. What is asked of every fleet
+        that could manage it is one passing job — the happy path is a property
+        too, and a gate that only proves the failure paths work is half a gate.
+        """
+        present = {p.name for p in profiles}
+        failures = []
+
+        def require(condition: bool, what: str, why: str) -> None:
+            if not condition:
+                failures.append(f"FLOOR: {what} — {why}")
+
+        if any(p.can_pass_a_job for p in profiles):
+            require(
+                self.outcomes.get("passed", 0) > 0,
+                "no job passed",
+                "a fleet that finishes nothing satisfies every safety invariant",
+            )
+        if "crasher" in present:
+            require(
+                self.fleet.get("crashes", 0) > 0,
+                "no bench crashed",
+                "the crasher profile is in the fleet and never fired",
+            )
+        if "flaky_network" in present:
+            require(
+                self.fleet.get("dropped_beats", 0) > 0,
+                "no heartbeat was dropped",
+                "flaky_network is in the fleet and never dropped one",
+            )
+        if "hung" in present:
+            require(
+                self.events.get("timed_out", 0) > 0,
+                "no job timed out",
+                "hung is in the fleet, so sweep 2 should have fired",
+            )
+        if any(p.can_die for p in profiles):
+            require(
+                self.events.get("offline", 0) > 0,
+                "no bench was reaped",
+                "profiles that stop heartbeating are in the fleet",
+            )
+        if any(p.can_strand_a_job for p in profiles):
+            require(
+                self.events.get("requeued", 0) > 0,
+                "no job was requeued",
+                "benches died holding jobs and nothing came back",
+            )
+        return failures
 
     def render(self) -> str:
         lines = [
@@ -97,6 +161,9 @@ class RunReport:
         ]
         for note in self.notes:
             lines.append(f"  !! {note}")
+        # A failed floor names itself exactly as a violation does: the run did
+        # not do what it claimed, and that is the same kind of red.
+        lines.extend(f"  !! {floor}" for floor in self.floors)
         if self.unfinished:
             lines.append(f"  !! I3 (liveness): {len(self.unfinished)} job(s) never finished")
             lines.extend(f"       {v}" for v in self.unfinished[:10])
@@ -333,6 +400,11 @@ class ChaosRun:
             "dropped_beats": sum(a.dropped_beats for a in self.fleet),
             "reregistrations": sum(a.reregistrations for a in self.fleet),
         }
+        self.report.floors = self.report.check_floors(
+            fleet_profiles(self.n_agents, self.profile_mix)
+        )
+        for floor in self.report.floors:
+            log.error("seed=%s  %s", self.seed, floor)
         self.report.duration_s = time.monotonic() - began
         self.store.close()
         return self.report

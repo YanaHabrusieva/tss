@@ -115,6 +115,8 @@ Any change that could violate one of these needs a test proving it doesn't.
   point between the check and the act and would pass against a naive implementation.
 - `just chaos` — 15 agents × 2–4 devices, 100 jobs at 30% multi-device, 5 seeds — must report zero
   invariant violations. **This is the merge gate.**
+- The gate asserts the chaos fired — floors per profile, and at least one job must pass. All green
+  from a quiet run proves nothing: neuter `crash_probability` and every invariant still holds.
 - Integration tests go over real HTTP. Never mock the transport; mocked tests pass while the real
   thing deadlocks.
 - Every chaos run logs its seed.

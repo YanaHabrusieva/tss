@@ -14,20 +14,33 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv venv --python 3.12 .venv
-      - run: uv pip install --python .venv/bin/python -e ".[dev]"
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          # Without this the cache key never changes and the cache is never
+          # invalidated; with it, a dependency bump is a cache miss, which is
+          # what a cache key is for.
+          cache-dependency-glob: uv.lock
+
+      # --frozen: install exactly what uv.lock says, and fail if pyproject.toml
+      # has drifted from it. Resolving fresh on every run means an upstream
+      # release can change what the gate tests with no commit in this repo —
+      # the stale-schema problem one layer up.
+      - run: uv sync --extra dev --frozen
 
       - name: lint
         run: |
           .venv/bin/python -m ruff check .
           .venv/bin/python -m ruff format --check .
 
+      # -m "not slow" skips the seeded chaos runs inside pytest: the gate below
+      # runs chaos across five seeds, and running it twice buys nothing but
+      # minutes.
       - name: tests
-        run: .venv/bin/python -m pytest
+        run: .venv/bin/python -m pytest -m "not slow"
 
       # 15 agents x 2-4 devices, 100 jobs at 30% multi-device, 5 seeds.
-      # Any invariant violation fails the build and names the seed to replay.
+      # Fails the build on any invariant violation, any job that never finished,
+      # and any profile that did not fire — see RunReport.check_floors.
       - name: chaos (merge gate)
         run: .venv/bin/python -m tss.chaos.runner --agents 15 --jobs 100 --multi-pct 30 --seeds 5 --seed 1

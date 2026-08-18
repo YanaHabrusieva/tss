@@ -7,8 +7,7 @@ default: test
 
 # Create the venv and install the project (Python 3.12+, §pyproject).
 install:
-    uv venv --python 3.12 {{venv}}
-    uv pip install --python {{py}} -e ".[dev]"
+    uv sync --extra dev
 
 # The full suite. Must pass before any commit (CLAUDE.md).
 test *ARGS:

@@ -10,6 +10,9 @@ jobs run side by side on one machine as long as they need different devices.
 
 - **Design and reasoning:** [`TSS-Architecture.md`](TSS-Architecture.md)
 - **Invariants and the rules that follow from them:** [`CLAUDE.md`](CLAUDE.md)
+- **How it was built with AI:** [`AILOG.md`](AILOG.md) — the log is the commit history; every
+  message carries the prompt, what the AI got wrong, and what was overridden. `AILOG.md` explains
+  the convention and quotes four of them verbatim.
 
 ---
 
@@ -37,7 +40,8 @@ runs, and use `.venv/bin/python -m ...` directly if you prefer.
 
 ## Run it
 
-Three terminals. **Terminal 1 — the service** (API, scheduler and reaper, one process):
+Three terminals. **Terminal 1 — the service** (the dispatcher: API, scheduler and reaper, one
+process):
 
 ```bash
 just serve                      # http://127.0.0.1:8000
@@ -193,6 +197,12 @@ claim, a fan-out that requeues per device instead of per job, a scheduler that c
 after a pass instead of before, and a reservation that takes hardware instead of withholding it. They
 all fail, which is the evidence that the tests catch what they were written for.
 
+`just chaos` fails on three things, not one: any invariant violation, any job that never reached a
+terminal state, and **any profile that did not fire**. A run where nothing broke satisfies every
+safety invariant trivially, so the gate also asserts what the run produced — that the crasher
+crashed, that heartbeats were dropped, that jobs timed out and were requeued, and that at least one
+job passed.
+
 CI runs lint, the suite, and the chaos gate on every push
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
@@ -207,6 +217,11 @@ CI runs lint, the suite, and the chaos gate on every push
 | `tss/agent/` | the daemon that runs on a bench: register, heartbeat, run, report |
 | `tss/chaos/` | mock benches with failure profiles, the seeded runner, the ground-truth checker |
 | `tss/cli/` | `tss fleet | queue | watch | why` |
+
+The `events` table is append-only and never pruned: retention and archival are deliberately out of
+scope for the POC, the same call as schema migrations (`TSS-Architecture.md` §13.6). Its hot paths
+are indexed so the fleet view and the invariant checker do not degrade as it grows, but on a
+long-running deployment it grows without bound and would need a retention policy.
 
 Nine invariants hold across every seed the chaos gate runs. Seven are database or scheduler
 properties (`tss/core/invariants.py`); **I1** — at most one agent is authorized to own a job, and

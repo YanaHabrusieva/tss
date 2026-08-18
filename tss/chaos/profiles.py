@@ -56,6 +56,34 @@ class Profile:
     #: fail every job it is given (a liar's tests cannot pass)
     fails_every_job: bool = False
 
+    @property
+    def can_pass_a_job(self) -> bool:
+        """Could a bench on this profile ever report a PASSED result?
+
+        `hung` never finishes, `liar` fails everything, `idle_death` vanishes
+        before taking work, and a `zombie` is ALWAYS fenced out — it goes silent
+        past its lease on every job, so its report is always rejected and the job
+        always goes back to the queue. A fleet made only of these cannot produce
+        a pass, so the gate's "at least one job passed" floor does not apply to
+        it. In any mixed fleet some bench can, and then it does.
+        """
+        return not (
+            self.never_completes
+            or self.fails_every_job
+            or self.idle_death_after_ttls
+            or self.silent_ttls
+        )
+
+    @property
+    def can_die(self) -> bool:
+        """Does this profile stop heartbeating on its own? (-> agent.offline)"""
+        return bool(self.crash_probability or self.idle_death_after_ttls or self.silent_ttls)
+
+    @property
+    def can_strand_a_job(self) -> bool:
+        """...while holding one, so the reap has something to requeue."""
+        return bool(self.crash_probability or self.silent_ttls)
+
 
 CLEAN = Profile("clean", "the happy path")
 CRASHER = Profile("crasher", "presence expiry and the fan-out requeue", crash_probability=0.3)

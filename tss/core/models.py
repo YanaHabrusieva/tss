@@ -268,6 +268,13 @@ class ResourceView(BaseModel):
     state: ResourceState
     current_job_id: str | None = None
     capabilities: dict[str, Any] = Field(default_factory=dict)
+    #: Set only when TSS quarantined this device after repeated failures. Both
+    #: that and an agent-reported fault read `unhealthy` in `state`, and they are
+    #: not the same thing to the person looking at the screen: one is the bench's
+    #: own report and it can withdraw it, the other is TSS's verdict and only an
+    #: operator or a new agent version clears it (§4.2).
+    quarantined_at: float | None = None
+    consecutive_fails: int = 0
 
 
 class AgentView(BaseModel):
@@ -284,6 +291,10 @@ class AgentView(BaseModel):
     #: Filled in for benches that were reaped, so the fleet view can say what the
     #: machine took down with it.
     requeued_on_last_reap: list[str] = Field(default_factory=list)
+    #: "quarantined since 14:02" — the useful half of a quarantine is when it
+    #: started, because that is what tells you whether anyone has looked at it.
+    quarantined_at: float | None = None
+    consecutive_fails: int = 0
 
     @property
     def busy(self) -> int:
@@ -298,6 +309,29 @@ class AgentView(BaseModel):
 class FleetView(BaseModel):
     now: float
     agents: list[AgentView] = Field(default_factory=list)
+
+
+#: How many hex characters of a job id a human needs to tell two jobs apart on
+#: one screen. Five is ~1M values: plenty for a fleet-sized queue, short enough
+#: to read aloud in a demo.
+SHORT_ID_CHARS = 5
+
+
+def short_id(job_id: str) -> str:
+    """`job-2bb76a1c` -> `2bb76`. The suffix, because the prefix is a constant."""
+    _, _, suffix = job_id.partition("-")
+    return (suffix or job_id)[:SHORT_ID_CHARS]
+
+
+def job_label(name: str | None, job_id: str) -> str:
+    """How a job is named on every HUMAN surface: `smoke-1 (2bb76)`.
+
+    Machines keep the full id everywhere — API payloads, events on the wire,
+    logs, and as accepted CLI arguments — because that is what is unique and
+    what you paste back in. Humans get the name they chose, with just enough id
+    to disambiguate the three `smoke` jobs on screen.
+    """
+    return f"{name} ({short_id(job_id)})" if name else short_id(job_id)
 
 
 def qualify(agent_id: str, local_id: str) -> str:

@@ -130,6 +130,15 @@ class QueueEntry(BaseModel):
     tried_agents: list[str] = Field(default_factory=list)
     blocked_reason: str | None = None
     reserving_on: str | None = None
+    #: Absolute wall-clock (§3.3), so a live view can re-derive "42s of 600s" and
+    #: "waited 35s" from data it already holds. `waited_s` and `elapsed_s` are
+    #: the same numbers as of the snapshot; these are what let a client tick them
+    #: forward without asking again, which is what keeps the page push-only.
+    submitted_at: float
+    started_at: float | None = None
+    #: Which devices are being withheld for this job — the reservation names a
+    #: bench in `reserving_on`, and this says which of its devices are held.
+    reserving_resource_ids: list[str] = Field(default_factory=list)
 
 
 class QueueView(BaseModel):
@@ -226,18 +235,30 @@ async def cancel_job(
     if result == "cancelled_running" and agent_id:
         directives.cancel_job(agent_id, job_id)
     scheduler.notify()  # its devices just came free
-    return {"cancelled": True, "job_id": job_id, "was_running": result == "cancelled_running"}
+    # `name` is additive and for the human on the other end of the CLI; `job_id`
+    # stays the full id, because that is what a machine reads back.
+    return {
+        "cancelled": True,
+        "job_id": job_id,
+        "name": job.name,
+        "was_running": result == "cancelled_running",
+    }
 
 
-def queue_view(store: Store, scheduler: Scheduler) -> QueueView:
+def queue_view(store: Store, scheduler: Scheduler, *, now: float | None = None) -> QueueView:
     """Queued and running jobs with wait times (§3.9).
 
     Elapsed-versus-budget is shown; an estimated start time is not. A confident
     "starts in ~3m" would be a lie without historical duration data, which the
     POC deliberately does not collect (§13.7) — and a number you cannot support
     is exactly the thing that gets pulled on.
+
+    `now` is a parameter for the same reason it is one on the store: a test that
+    reasons about a synthetic T0 and a view that reads the wall clock disagree
+    silently, and that mismatch has cost more debugging rounds here than any
+    bug it ever hid.
     """
-    now = time.time()
+    now = time.time() if now is None else now
     view = QueueView(now=now)
     for job in store.jobs_in_flight():
         reservation = scheduler.reservation_for(job.id)
@@ -256,6 +277,9 @@ def queue_view(store: Store, scheduler: Scheduler) -> QueueView:
             tried_agents=job.tried_agents,
             blocked_reason=job.blocked_reason,
             reserving_on=reservation.agent_id if reservation else None,
+            submitted_at=job.submitted_at,
+            started_at=job.started_at,
+            reserving_resource_ids=sorted(reservation.resource_ids) if reservation else [],
         )
         if job.state == JobState.QUEUED:
             view.queued.append(entry)

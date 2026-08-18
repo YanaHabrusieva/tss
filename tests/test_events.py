@@ -271,7 +271,7 @@ def test_the_watch_screen_renders_an_empty_fleet_and_a_full_one():
     screen = FleetScreen("http://127.0.0.1:8000")
     console = Console(width=100, record=True, file=io.StringIO())
 
-    console.print(screen.render())  # empty: no snapshot has arrived yet
+    console.print(screen.render(40))  # empty: no snapshot has arrived yet
     assert "no benches registered" in console.export_text()
 
     screen.apply(
@@ -325,7 +325,7 @@ def test_the_watch_screen_renders_an_empty_fleet_and_a_full_one():
         }
     )
     screen.apply({"type": "event", "event": {"ts": T0, "kind": "agent.offline", "detail": {}}})
-    console.print(screen.render())
+    console.print(screen.render(40))
 
     rendered = console.export_text()
     assert "OFFLINE" in rendered, "state must be readable without colour"

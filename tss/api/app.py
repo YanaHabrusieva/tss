@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from tss.api import agent, client, ws
+from tss.api import agent, client, web, ws
 from tss.core.config import Config
 from tss.core.directives import DirectiveQueue
 from tss.core.events import EventBus
@@ -64,6 +64,8 @@ def create_app(config: Config | None = None, store: Store | None = None) -> Fast
     app.include_router(agent.job_router)
     app.include_router(client.router)
     app.include_router(ws.router)
+    # `GET /` — the same feed, in a browser.
+    app.include_router(web.router)
     return app
 
 

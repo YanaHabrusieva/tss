@@ -1848,6 +1848,8 @@ class Store:
                     state=resource.state,
                     current_job_id=resource.current_job_id,
                     capabilities=resource.capabilities,
+                    quarantined_at=resource.quarantined_at,
+                    consecutive_fails=resource.consecutive_fails,
                 )
             )
 
@@ -1875,6 +1877,8 @@ class Store:
                     seconds_since_beat=max(0.0, now - agent.last_heartbeat_at),
                     resources=by_agent.get(agent.id, []),
                     requeued_on_last_reap=requeued,
+                    quarantined_at=agent.quarantined_at,
+                    consecutive_fails=agent.consecutive_fails,
                 )
             )
         return FleetView(now=now, agents=agents)

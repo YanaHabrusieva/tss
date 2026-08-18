@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TSS — fleet</title>
+<style>
+  :root{
+    --bg:#15171E; --panel:#1C1F27; --panel2:#20242E; --line:#31364226;
+    --ink:#F0EFEA; --muted:#9B99A3; --faint:#6D6C75;
+    --ok:#6FD3AC;   --ok-bg:#12291F;
+    --busy:#8FB0FF; --busy-bg:#1B2540;
+    --warn:#F7C453; --warn-bg:#2E2510;
+    --bad:#FF8DA8;  --bad-bg:#301A22;
+    --lineS:#2E323D;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+       -webkit-font-smoothing:antialiased;}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+  /* ── header ── */
+  header{display:flex;align-items:center;gap:18px;padding:14px 26px;
+         border-bottom:1px solid var(--lineS);background:var(--panel)}
+  .brand{font-size:19px;font-weight:700;letter-spacing:.02em}
+  .brand span{color:var(--muted);font-weight:400}
+  .live{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ok);font-weight:600}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
+  .sum{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+  .sumchip{font-size:12px;color:var(--muted);border:1px solid var(--lineS);border-radius:6px;
+           padding:3px 10px;background:var(--panel2)}
+  .sumchip b{color:var(--ink);font-weight:600}
+
+  /* hidden by default — shown when the WS drops (design spec for the real page) */
+  #disconnected{display:none;background:var(--bad-bg);color:var(--bad);border-bottom:1px solid var(--bad);
+                padding:8px 26px;font-weight:700;letter-spacing:.04em}
+
+  /* ── layout ── */
+  main{display:grid;grid-template-columns:1fr 380px;gap:22px;padding:22px 26px;max-width:1560px}
+  h2{font-size:12px;font-weight:700;letter-spacing:.12em;color:var(--faint);margin:0 0 10px;text-transform:uppercase}
+
+  /* ── bench cards ── */
+  .benches{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .bench{background:var(--panel);border:1px solid var(--lineS);border-radius:12px;padding:14px 16px}
+  .bench.off{border-color:#5A2733;background:#1B161B}
+  .bhead{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
+  .bname{font-size:16.5px;font-weight:700}
+  .beat{font-size:11.5px;color:var(--faint);margin-left:auto}
+  .load{font-size:11.5px;color:var(--muted)}
+  .chip{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.05em;border-radius:5px;
+        padding:2px 8px;border:1px solid}
+  .c-ok{color:var(--ok);background:var(--ok-bg);border-color:#2A5943}
+  .c-busy{color:var(--busy);background:var(--busy-bg);border-color:#33477A}
+  .c-warn{color:var(--warn);background:var(--warn-bg);border-color:#5E4A1A}
+  .c-bad{color:var(--bad);background:var(--bad-bg);border-color:#5E2D3C}
+  .dev{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:8px;
+       background:var(--panel2);margin-top:6px;font-size:13px;
+       border-left:3px solid transparent}
+  /* the row itself is tinted by state — the word still carries the state, the tint reinforces */
+  .dev.free{background:var(--ok-bg);border-left-color:var(--ok)}
+  .dev.busy{background:var(--busy-bg);border-left-color:var(--busy)}
+  .dev.resv{background:var(--warn-bg);border-left-color:var(--warn)}
+  .dev.unh {background:var(--warn-bg);border-left-color:var(--warn)}  /* unhealthy — agent's own report */
+  .dev.quar{background:var(--bad-bg); border-left-color:var(--bad)}   /* quarantined — TSS's verdict */
+  .dev.gone{background:#1A1D24;border-left-color:#3A3E48}
+  .dev .id{font-weight:600;min-width:52px}
+  .dev .cap{color:var(--faint);font-size:11px}
+  .dev .st{margin-left:auto;font-weight:700;font-size:12px;text-align:right}
+  .st.free{color:var(--ok)} .st.busy{color:var(--busy)} .st.resv{color:var(--warn)}
+  .st.quar{color:var(--bad)} .st.gone{color:var(--faint)}
+  .offnote{margin-top:9px;font-size:12px;color:var(--bad)}
+  /* a QUARANTINED bench card (none in this scene) reuses .off's treatment: red border,
+     chip c-bad reading QUARANTINED, devices shown as "held", and the note reads e.g.
+     "quarantined since 14:02 — 3 infra errors across 2 devices · tss unquarantine to clear" */
+
+  /* ── jobs ── */
+  .jobs{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:22px}
+  .jcard{background:var(--panel);border:1px solid var(--lineS);border-radius:12px;padding:14px 16px}
+  .jrow{padding:9px 0;border-top:1px solid var(--lineS)}
+  .jrow:first-of-type{border-top:none}
+  .jname{font-weight:700;font-size:14.5px}
+  .jid{color:var(--faint);font-weight:400}
+  .jmeta{font-size:12px;color:var(--muted);margin-top:3px}
+  .jmeta b{color:var(--ink);font-weight:600}
+  .bar{height:6px;border-radius:3px;background:#2A2E38;margin-top:7px;overflow:hidden}
+  .bar i{display:block;height:100%;border-radius:3px;background:var(--busy)}
+  .why{font-size:12px;margin-top:4px;color:var(--warn)}
+  .why.wait{color:var(--muted)}
+
+  /* ── events ── */
+  aside{background:var(--panel);border:1px solid var(--lineS);border-radius:12px;padding:14px 16px;align-self:start}
+  /* kind column sizes to the longest kind on screen — long kinds must never overflow */
+  aside{display:grid;grid-template-columns:max-content max-content 1fr;column-gap:8px}
+  aside h2{grid-column:1 / -1}
+  .ev{display:grid;grid-template-columns:subgrid;grid-column:1 / -1;padding:7px 0;
+      border-top:1px solid var(--lineS);font-size:12.5px;align-items:baseline}
+  .ev:first-of-type{border-top:none}
+  .ev .t{color:var(--faint);font-size:11px}
+  .ev .k{font-weight:700;font-size:11.5px}
+  .k.ok{color:var(--ok)} .k.busy{color:var(--busy)} .k.warn{color:var(--warn)} .k.bad{color:var(--bad)} .k.mut{color:var(--muted)}
+  .ev .d{color:var(--muted)} .ev .d b{color:var(--ink);font-weight:600}
+
+  /* ── state key ── */
+  .legend{margin:0 26px;max-width:1508px;background:var(--panel);border:1px solid var(--lineS);
+          border-radius:12px;padding:12px 16px}
+  .lrow{display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:4px 0;font-size:12px}
+  .lcap{width:56px;color:var(--faint);font-size:10.5px;text-transform:uppercase;
+        letter-spacing:.08em;font-weight:700}
+  .lhint{color:var(--faint);font-size:11px;margin-right:8px}
+  .c-mut{color:var(--muted);background:var(--panel2);border-color:var(--lineS)}
+
+  footer{padding:10px 26px 20px;font-size:11.5px;color:var(--faint)}
+</style>
+</head>
+<body>
+
+<div id="disconnected">DISCONNECTED — reconnecting… the view will re-snapshot when the service returns</div>
+
+<header>
+  <div class="brand">TSS <span>· fleet</span></div>
+  <div class="live"><span class="dot"></span>LIVE</div>
+  <div class="sum">
+    <span class="sumchip"><b>3</b> benches · <b>2</b> online</span>
+    <span class="sumchip"><b>2</b> busy · <b>1</b> reserved · <b>1</b> free · <b>1</b> quarantined · <b>2</b> offline devices</span>
+    <span class="sumchip"><b>2</b> running · <b>2</b> queued</span>
+  </div>
+</header>
+
+<main>
+  <section>
+    <h2>Fleet</h2>
+    <div class="benches">
+
+      <div class="bench">
+        <div class="bhead">
+          <span class="bname mono">bench-sf-01</span>
+          <span class="chip c-ok">ONLINE</span>
+          <span class="beat">beat 1s ago</span>
+        </div>
+        <div class="load">load 1/2 · 1 reserved</div>
+        <div class="dev busy"><span class="id mono">vg-01</span><span class="cap">vehicle_gateway</span>
+          <span class="st busy">BUSY · smoke-1 <span class="jid mono">(2bb76)</span></span></div>
+        <div class="dev resv"><span class="id mono">vg-02</span><span class="cap">vehicle_gateway</span>
+          <span class="st resv">free · RESERVED for gw2gw</span></div>
+      </div>
+
+      <div class="bench">
+        <div class="bhead">
+          <span class="bname mono">bench-ag-01</span>
+          <span class="chip c-ok">ONLINE</span>
+          <span class="beat">beat 2s ago</span>
+        </div>
+        <div class="load">load 1/2 · 1 quarantined</div>
+        <div class="dev busy"><span class="id mono">ag-01</span><span class="cap">asset_gateway</span>
+          <span class="st busy">BUSY · smoke-2 <span class="jid mono">(9d1f2)</span></span></div>
+        <div class="dev free"><span class="id mono">ag-02</span><span class="cap">asset_gateway</span>
+          <span class="st free">free</span></div>
+        <div class="dev quar"><span class="id mono">ag-03</span><span class="cap">asset_gateway</span>
+          <span class="st quar">QUARANTINED · 3 infra errors</span></div>
+      </div>
+
+      <div class="bench off">
+        <div class="bhead">
+          <span class="bname mono">bench-sf-02</span>
+          <span class="chip c-bad">OFFLINE</span>
+          <span class="beat">last beat 16s ago</span>
+        </div>
+        <div class="load">—</div>
+        <div class="dev gone"><span class="id mono">vg-01</span><span class="cap">vehicle_gateway</span>
+          <span class="st gone">freed</span></div>
+        <div class="dev gone"><span class="id mono">vg-02</span><span class="cap">vehicle_gateway</span>
+          <span class="st gone">freed</span></div>
+        <div class="offnote">presence expired — 1 job requeued</div>
+      </div>
+    </div>
+
+    <div class="jobs">
+      <div class="jcard">
+        <h2>Running · 2</h2>
+        <div class="jrow">
+          <div class="jname">smoke-1 <span class="jid mono">(2bb76)</span></div>
+          <div class="jmeta"><b>bench-sf-01</b> · vg-01 · 42s of 600s budget</div>
+          <div class="bar"><i style="width:7%"></i></div>
+        </div>
+        <div class="jrow">
+          <div class="jname">smoke-2 <span class="jid mono">(9d1f2)</span></div>
+          <div class="jmeta"><b>bench-ag-01</b> · ag-01 · 18s of 20s budget</div>
+          <div class="bar"><i style="width:90%"></i></div>
+        </div>
+      </div>
+      <div class="jcard">
+        <h2>Queued · 2</h2>
+        <div class="jrow">
+          <div class="jname">gw2gw <span class="jid mono">(067fe)</span></div>
+          <div class="jmeta">needs <b>2 × vehicle_gateway</b>, all on one bench · waited 35s</div>
+          <div class="why">RESERVING on bench-sf-01 — vg-02 held for this job; waiting on vg-01 to free</div>
+        </div>
+        <div class="jrow">
+          <div class="jname">regression1 <span class="jid mono">(a1b2c)</span></div>
+          <div class="jmeta">needs <b>1 × vehicle_gateway</b> · requeued from bench-sf-02</div>
+          <div class="why wait">waiting — no free vehicle_gateway (vg-02 is reserved by gw2gw)</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <aside>
+    <h2>Events</h2>
+    <div class="ev"><span class="t mono">21:12:03</span><span class="k warn">job.requeued</span>
+      <span class="d"><b>regression1</b> <span class="mono jid">(a1b2c)</span> — bench-sf-02 died · epoch 2</span></div>
+    <div class="ev"><span class="t mono">21:12:03</span><span class="k bad">agent.offline</span>
+      <span class="d"><b>bench-sf-02</b> — presence expired · 1 job requeued · 2 devices freed</span></div>
+    <div class="ev"><span class="t mono">21:11:47</span><span class="k busy">job.started</span>
+      <span class="d"><b>smoke-2</b> on bench-ag-01</span></div>
+    <div class="ev"><span class="t mono">21:11:47</span><span class="k busy">job.assigned</span>
+      <span class="d"><b>smoke-2</b> → bench-ag-01 · ag-01</span></div>
+    <div class="ev"><span class="t mono">21:11:31</span><span class="k busy">job.assigned</span>
+      <span class="d"><b>regression1</b> → bench-sf-02 · vg-01</span></div>
+    <div class="ev"><span class="t mono">21:11:29</span><span class="k mut">agent.registered</span>
+      <span class="d"><b>bench-sf-02</b> — 2 devices</span></div>
+    <div class="ev"><span class="t mono">21:11:23</span><span class="k busy">job.started</span>
+      <span class="d"><b>smoke-1</b> on bench-sf-01</span></div>
+    <div class="ev"><span class="t mono">21:10:58</span><span class="k ok">job.completed</span>
+      <span class="d"><b>smoke-b</b> — passed · 15s</span></div>
+    <div class="ev"><span class="t mono">21:10:55</span><span class="k ok">job.completed</span>
+      <span class="d"><b>smoke-a</b> — passed · 15s</span></div>
+    <div class="ev"><span class="t mono">21:10:49</span><span class="k bad">resource.quarantined</span>
+      <span class="d"><b>ag-03</b> on bench-ag-01 — 3 infra errors in a row</span></div>
+  </aside>
+</main>
+
+<section class="legend">
+  <div class="lrow"><span class="lcap">bench</span>
+    <span class="chip c-ok">ONLINE</span>
+    <span class="chip c-warn">DRAINING</span><span class="lhint">finishing its jobs, taking nothing new</span>
+    <span class="chip c-bad">OFFLINE</span><span class="lhint">not heartbeating — may come back by itself</span>
+    <span class="chip c-bad">QUARANTINED</span><span class="lhint">TSS refuses it — cleared by an operator or a new agent version</span>
+  </div>
+  <div class="lrow"><span class="lcap">device</span>
+    <span class="chip c-ok">free</span>
+    <span class="chip c-busy">BUSY</span>
+    <span class="chip c-warn">RESERVED</span><span class="lhint">still free — held for a waiting job</span>
+    <span class="chip c-warn">unhealthy</span><span class="lhint">the bench's own report, withdrawable</span>
+    <span class="chip c-bad">QUARANTINED</span><span class="lhint">TSS's verdict — 3 infra errors in a row</span>
+    <span class="chip c-mut">freed</span><span class="lhint">bench offline</span>
+    <span class="chip c-mut">retired</span><span class="lhint">gone from inventory</span>
+  </div>
+  <div class="lrow"><span class="lcap">job</span>
+    <span class="chip c-mut">queued</span>
+    <span class="chip c-busy">running</span>
+    <span class="chip c-ok">passed</span>
+    <span class="chip c-warn">infra_error</span><span class="lhint">environment's fault — retried elsewhere</span>
+    <span class="chip c-bad">failed</span><span class="lhint">a real result — never auto-retried</span>
+    <span class="chip c-bad">dead_letter</span><span class="lhint">gave up after repeated infra errors</span>
+    <span class="chip c-mut">cancelled</span>
+  </div>
+</section>
+
+<footer>read-only · pushed over WS /v1/events — snapshot, then deltas · the same feed tss watch renders</footer>
+
+</body>
+</html>

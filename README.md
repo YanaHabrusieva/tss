@@ -73,8 +73,16 @@ just submit gateway-to-gateway 2      # TWO devices, both on ONE bench
 just fleet                            # benches with their devices
 just queue                            # what is running, what is waiting
 just watch                            # the live view — this is the one to have on screen
-just why job-1a2b3c4d                 # why is that job not running yet?
+just why smoke                        # why is that job not running yet?
 ```
+
+The service also serves the live fleet view at **<http://127.0.0.1:8000/>** — the same feed `tss
+watch` renders, in a browser: one self-contained page, pushed over `WS /v1/events`, never polled. It
+needs no internet, loads nothing from a CDN, and re-snapshots from scratch if the connection drops.
+
+Jobs read as `smoke-1 (2bb76)` on every human surface — the name you chose, plus enough of the id to
+tell three `smoke` jobs apart. The full `job-2bb76a1c` stays on the wire and in the logs; `tss why`
+and `tss cancel` accept either that or the short id or the name you can see on screen.
 
 `just submit NAME DEVICES DURATION` is a convenience wrapper. The API underneath is plain HTTP:
 
@@ -121,7 +129,8 @@ In another terminal, kill a bench that is running something:
 pkill -f "tss.agent.daemon --id bench-sf-01"
 ```
 
-The bench flips to **OFFLINE** and its jobs re-queue **within about 14 seconds** — `PRESENCE_TTL`
+The bench flips to **OFFLINE** on both `tss watch` and the web page, and its jobs re-queue **within
+about 14 seconds** — `PRESENCE_TTL`
 (12s) plus `REAPER_INTERVAL` (2s). The view is pushed over a WebSocket, so the change appears the
 moment it happens rather than on the next poll. Nothing is lost: the jobs land on another bench and
 finish, and if the killed agent ever comes back its results are rejected as stale.
@@ -150,19 +159,19 @@ Then, in a fourth:
 just submit soak 1 90     # takes one of bench-sf-01's two vehicle gateways
 just submit gw2gw 2       # needs TWO vehicle gateways on one bench: nowhere to fit
 sleep 6
-just queue                # -> gw2gw: RESERVING on bench-sf-01
+just queue                # -> gw2gw: RESERVING on bench-sf-01 (vg-02 held)
 just submit smoke 1 20    # another vehicle-gateway job — it does NOT take the reserved device
 just fleet                # -> bench-sf-01 vg-02 still free, and still nobody's
 ```
 
 ```
-job-54cbed9c  QUEUED  10s waited  — RESERVING on bench-sf-01 (vg-02)
+gw2gw (54cbe)  QUEUED  10s waited  — RESERVING on bench-sf-01 (vg-02)
   needs: 2 devices, all on ONE bench
            product=vehicle_gateway
            product=vehicle_gateway
   feasible benches (could ever satisfy this):
     bench-sf-01
-      vg-01   BUSY job-f347ec91 (11s / 600s budget)
+      vg-01   BUSY soak (f347e) (11s / 600s budget)
       vg-02   free  RESERVED FOR YOU
   not feasible:
     bench-ag-01  only 0 healthy matching device(s), needs 2
@@ -213,7 +222,7 @@ CI runs lint, the suite, and the chaos gate on every push
 | | |
 |---|---|
 | `tss/core/` | store (all writes, the N-way claim), matcher, scheduler, reaper, events, invariants |
-| `tss/api/` | `/v1/agents/*` for benches, `/v1/jobs`, `/v1/fleet`, `/v1/queue` for humans, `WS /v1/events` |
+| `tss/api/` | `/v1/agents/*` for benches, `/v1/jobs`, `/v1/fleet`, `/v1/queue` for humans, `WS /v1/events`, and `/` — the web view, one file in `api/static/` |
 | `tss/agent/` | the daemon that runs on a bench: register, heartbeat, run, report |
 | `tss/chaos/` | mock benches with failure profiles, the seeded runner, the ground-truth checker |
 | `tss/cli/` | `tss fleet | queue | watch | why` |

@@ -3,7 +3,7 @@
     tss fleet          benches with their devices nested underneath
     tss queue          what is running and what is waiting
     tss watch          the same, live, pushed over a WebSocket
-    tss why <job_id>   why that job is not running yet
+    tss why <job>      why that job is not running yet
 
     tss drain <agent>          finish current jobs, accept no more
     tss unquarantine <target>  let a bench or a device back in
@@ -12,6 +12,12 @@
 Three surfaces, one data source. Every state machine transition that is not
 automatic has a verb here (§4.1, §4.2) — a state with no way out is a slow
 fleet-drain dressed up as a health feature.
+
+HUMANS READ NAMES, MACHINES READ IDS. Every job printed here is `smoke-1 (2bb76)`
+— the name the engineer chose, plus enough id to tell three `smoke` jobs apart.
+The full id stays on the wire, in the logs, and in every argument these commands
+accept. `why` and `cancel` additionally accept what is actually on the screen —
+the short id or the name — because an id a human can read is an id a human types.
 """
 
 from __future__ import annotations
@@ -25,6 +31,8 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from tss.core.models import job_label, short_id
+
 DEFAULT_URL = "http://127.0.0.1:8000"
 
 STATE_STYLE = {
@@ -35,8 +43,8 @@ STATE_STYLE = {
 }
 
 
-def _resources_cell(agent: dict, *, show_all: bool) -> Text:
-    """`vg-01 BUSY job-8f21 · vg-02 free · ag-01 free` — the two-level view.
+def _resources_cell(agent: dict, *, show_all: bool, names: dict[str, str]) -> Text:
+    """`vg-01 BUSY smoke-1 (2bb76) · vg-02 free · ag-01 free` — the two-level view.
 
     Retired devices are hidden unless --all: they are gone from the bench, and a
     fleet view that fills up with devices nobody can ever repair is a fleet view
@@ -51,9 +59,16 @@ def _resources_cell(agent: dict, *, show_all: bool) -> Text:
         if state == "busy":
             cell.append(f"{resource['local_id']} BUSY", style="bold yellow")
             if resource["current_job_id"]:
-                cell.append(f" {resource['current_job_id']}", style="dim")
+                job_id = resource["current_job_id"]
+                cell.append(f" {job_label(names.get(job_id), job_id)}", style="dim")
         elif state == "unhealthy":
-            cell.append(f"{resource['local_id']} UNHEALTHY", style="red")
+            # The bench's own report and TSS's verdict both read `unhealthy` in
+            # the row; only the second one needs an operator to clear it (§4.2).
+            quarantined = resource.get("quarantined_at") is not None
+            cell.append(
+                f"{resource['local_id']} {'QUARANTINED' if quarantined else 'UNHEALTHY'}",
+                style="red",
+            )
         elif state == "retired":
             cell.append(f"{resource['local_id']} retired", style="dim strike")
         else:
@@ -69,7 +84,13 @@ def _resources_cell(agent: dict, *, show_all: bool) -> Text:
     return cell
 
 
-def render_fleet(fleet: dict, console: Console, *, show_all: bool = False) -> None:
+def render_fleet(
+    fleet: dict,
+    console: Console,
+    *,
+    show_all: bool = False,
+    names: dict[str, str] | None = None,
+) -> None:
     table = Table(box=None, pad_edge=False, header_style="bold")
     table.add_column("BENCH")
     table.add_column("STATE")
@@ -87,7 +108,7 @@ def render_fleet(fleet: dict, console: Console, *, show_all: bool = False) -> No
             agent["id"],
             Text(label, style=STATE_STYLE.get(state, "")),
             f"{agent['seconds_since_beat']:.0f}s",
-            _resources_cell(agent, show_all=show_all),
+            _resources_cell(agent, show_all=show_all, names=names or {}),
             "—" if state == "offline" else f"{busy}/{total}",
         )
 
@@ -104,7 +125,6 @@ def render_queue(queue: dict, console: Console) -> None:
     """
     running = Table(box=None, pad_edge=False, header_style="bold", title_justify="left")
     running.add_column("JOB")
-    running.add_column("NAME")
     running.add_column("STATE")
     running.add_column("BENCH")
     running.add_column("DEVICES")
@@ -112,8 +132,7 @@ def render_queue(queue: dict, console: Console) -> None:
     for job in queue["running"]:
         elapsed = job["elapsed_s"]
         running.add_row(
-            job["job_id"],
-            job["name"],
+            job_label(job["name"], job["job_id"]),
             Text(job["state"].upper(), style="yellow" if job["state"] == "running" else "cyan"),
             job["agent_id"] or "—",
             " · ".join(r.split(":", 1)[-1] for r in job["resource_ids"]) or "—",
@@ -122,7 +141,6 @@ def render_queue(queue: dict, console: Console) -> None:
 
     queued = Table(box=None, pad_edge=False, header_style="bold")
     queued.add_column("JOB")
-    queued.add_column("NAME")
     queued.add_column("NEEDS")
     queued.add_column("WAITED", justify="right")
     queued.add_column("WHY", overflow="fold")
@@ -137,7 +155,10 @@ def render_queue(queue: dict, console: Console) -> None:
             # The non-obvious answer to "why am I waiting" once jobs need several
             # devices — and nine times out of ten the thing that looks like a
             # scheduler bug is this, working correctly (§3.9).
+            held = ", ".join(r.split(":", 1)[-1] for r in job.get("reserving_resource_ids", []))
             why.append(f"RESERVING on {job['reserving_on']}", style="bold cyan")
+            if held:
+                why.append(f" ({held} held)", style="cyan")
         elif job["blocked_reason"] == "no_capable_agent":
             why.append("UNSATISFIABLE — no bench in the fleet can run this", style="bold red")
         elif job["blocked_reason"]:
@@ -146,7 +167,7 @@ def render_queue(queue: dict, console: Console) -> None:
             why.append(
                 f"  retry {job['attempt']}, tried {len(job['tried_agents'])} bench(es)", "dim"
             )
-        queued.add_row(job["job_id"], job["name"], needs, f"{job['waited_s']:.0f}s", why)
+        queued.add_row(job_label(job["name"], job["job_id"]), needs, f"{job['waited_s']:.0f}s", why)
 
     console.print(f"[bold]RUNNING[/bold] ({len(queue['running'])})")
     console.print(running if queue["running"] else Text("  nothing running", style="dim"))
@@ -171,7 +192,7 @@ def _get(args: argparse.Namespace, path: str, console: Console) -> dict | None:
     return response.json()
 
 
-def render_why(why: dict, console: Console) -> None:
+def render_why(why: dict, console: Console, *, names: dict[str, str] | None = None) -> None:
     """The customer feature (§3.9). Nobody builds this and every firmware
     engineer wants it.
 
@@ -181,7 +202,7 @@ def render_why(why: dict, console: Console) -> None:
     number that gets pulled on.
     """
     state = why["state"].upper()
-    header = Text(f"{why['job_id']}  ", style="bold")
+    header = Text(f"{job_label(why.get('name'), why['job_id'])}  ", style="bold")
     header.append(state, style="bold cyan" if state in ("RUNNING", "ASSIGNED") else "bold")
     header.append(f"  {why['waited_s']:.0f}s waited")
     if why.get("reserving"):
@@ -225,7 +246,7 @@ def render_why(why: dict, console: Console) -> None:
         for bench in why["feasible"]:
             console.print(f"    [bold]{bench['agent_id']}[/bold]")
             for device in bench["devices"]:
-                console.print(f"      {_device_line(device)}")
+                console.print(f"      {_device_line(device, names or {})}")
     if why["infeasible"]:
         console.print("  not feasible:")
         for bench in why["infeasible"]:
@@ -236,12 +257,13 @@ def render_why(why: dict, console: Console) -> None:
         console.print("  nothing else can take those devices while you wait")
 
 
-def _device_line(device: dict) -> Text:
+def _device_line(device: dict, names: dict[str, str] | None = None) -> Text:
     line = Text(f"{device['local_id']:<8}")
     state = device["state"]
     if state == "busy":
         line.append("BUSY", style="bold cyan")
-        line.append(f" {device['current_job_id']}")
+        job_id = device["current_job_id"]
+        line.append(f" {job_label((names or {}).get(job_id), job_id)}")
         if device.get("elapsed_s") is not None and device.get("budget_s"):
             line.append(f" ({device['elapsed_s']:.0f}s / {device['budget_s']}s budget)")
     elif state == "free":
@@ -253,6 +275,46 @@ def _device_line(device: dict) -> Text:
     elif not device["matches"]:
         line.append("  (does not match)", style="dim")
     return line
+
+
+def _job_names(queue: dict | None) -> dict[str, str]:
+    """job_id -> name, for the surfaces whose own data only carries the id.
+
+    A device row knows `current_job_id` and nothing else; the queue is the
+    authority on what a job is called. Every device that is BUSY holds a job in
+    `assigned` or `running` (I8), and both are in the queue view, so this is a
+    total lookup in practice — and falls back to the short id when it is not.
+    """
+    if not queue:
+        return {}
+    return {job["job_id"]: job["name"] for job in queue["running"] + queue["queued"]}
+
+
+def _resolve_job(args: argparse.Namespace, token: str, console: Console) -> str | None:
+    """Accept the full id a machine would use, or the label a human just read.
+
+    Full ids pass straight through untouched — including for jobs long finished
+    and gone from the queue. Anything else is matched against the live queue by
+    short id or by name; an ambiguous match prints the candidates rather than
+    picking one.
+    """
+    if token.startswith("job-"):
+        return token
+    queue = _get(args, "/v1/queue", console)
+    if queue is None:
+        return None
+    jobs = queue["running"] + queue["queued"]
+    hits = [j for j in jobs if short_id(j["job_id"]) == token or j["name"] == token]
+    if not hits:
+        console.print(f"[red]no job in the queue matches[/red] {token}")
+        console.print("[dim]finished jobs are gone from the queue — use the full job id[/dim]")
+        return None
+    if len({j["job_id"] for j in hits}) > 1:
+        console.print(f"[red]{token} is ambiguous[/red] — {len(hits)} jobs match:")
+        for job in hits:
+            console.print(f"  {job_label(job['name'], job['job_id'])}  [dim]{job['job_id']}[/dim]")
+        return None
+    return hits[0]["job_id"]
 
 
 def _post(args: argparse.Namespace, path: str, console: Console) -> dict | None:
@@ -303,8 +365,11 @@ def cmd_unquarantine(args: argparse.Namespace) -> int:
 
 def cmd_cancel(args: argparse.Namespace) -> int:
     console = Console()
+    job_id = _resolve_job(args, args.job_id, console)
+    if job_id is None:
+        return 1
     try:
-        response = httpx.delete(f"{args.url.rstrip('/')}/v1/jobs/{args.job_id}", timeout=10.0)
+        response = httpx.delete(f"{args.url.rstrip('/')}/v1/jobs/{job_id}", timeout=10.0)
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         detail = ""
@@ -316,22 +381,26 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         console.print(f"[red]cannot reach TSS at {args.url}[/red] ({exc.__class__.__name__})")
         return 1
     body = response.json()
+    label = job_label(body.get("name"), job_id)
     if body.get("was_running"):
         console.print(
-            f"[bold]{args.job_id}[/bold] CANCELLED — its devices are free and the bench "
+            f"[bold]{label}[/bold] CANCELLED — its devices are free and the bench "
             "has been told to stop."
         )
     else:
-        console.print(f"[bold]{args.job_id}[/bold] CANCELLED before it started.")
+        console.print(f"[bold]{label}[/bold] CANCELLED before it started.")
     return 0
 
 
 def cmd_why(args: argparse.Namespace) -> int:
     console = Console()
-    why = _get(args, f"/v1/jobs/{args.job_id}/why", console)
+    job_id = _resolve_job(args, args.job_id, console)
+    if job_id is None:
+        return 1
+    why = _get(args, f"/v1/jobs/{job_id}/why", console)
     if why is None:
         return 1
-    render_why(why, console)
+    render_why(why, console, names=_job_names(_get(args, "/v1/queue", console)))
     return 0
 
 
@@ -355,7 +424,8 @@ def cmd_fleet(args: argparse.Namespace) -> int:
     fleet = _get(args, "/v1/fleet", console)
     if fleet is None:
         return 1
-    render_fleet(fleet, console, show_all=args.all)
+    names = _job_names(_get(args, "/v1/queue", console))
+    render_fleet(fleet, console, show_all=args.all, names=names)
     return 0
 
 
@@ -376,7 +446,9 @@ def main(argv: list[str] | None = None) -> int:
     watch_cmd.add_argument("--all", action="store_true", help="include retired devices")
 
     why_cmd = sub.add_parser("why", help="why is this job not running?")
-    why_cmd.add_argument("job_id")
+    why_cmd.add_argument(
+        "job_id", metavar="job", help="full job id, or the short id / name on screen"
+    )
 
     drain_cmd = sub.add_parser("drain", help="finish current jobs, accept no more")
     drain_cmd.add_argument("agent")
@@ -385,7 +457,9 @@ def main(argv: list[str] | None = None) -> int:
     unq_cmd.add_argument("target", help="agent id, or resource id as bench:device")
 
     cancel_cmd = sub.add_parser("cancel", help="stop a job")
-    cancel_cmd.add_argument("job_id")
+    cancel_cmd.add_argument(
+        "job_id", metavar="job", help="full job id, or the short id / name on screen"
+    )
 
     args = parser.parse_args(argv)
     if args.command == "fleet":

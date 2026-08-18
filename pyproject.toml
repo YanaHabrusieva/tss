@@ -30,6 +30,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tss"]
+# `GET /` serves this out of the package, so a wheel without it is a 404 in
+# front of an audience. Named explicitly rather than relying on the default
+# include-everything-under-the-package behaviour.
+artifacts = ["tss/api/static/index.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

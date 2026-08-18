@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TSS — fleet</title>
+<!--
+  The live fleet view. ONE file, no build step, no framework, and NOT ONE
+  external request: no CDN, no web font, no image. The machine this runs on at a
+  demo may have no internet, and a page that half-loads is worse than a page that
+  never existed.
+
+  IT NEVER POLLS. Every byte of state arrives over `WS /v1/events` — a snapshot
+  on connect, then deltas — and the push IS the demo: a bench dying and this
+  page going red are the same moment, not one moment and then up to a second.
+  The only timer here is local: it re-derives elapsed/waited/ago from data
+  already in hand. It sends nothing.
+
+  ON RECONNECT IT FORGETS EVERYTHING. Fleet, queue, events, learned job names —
+  all dropped, and rebuilt from the fresh snapshot. Merging across a reconnect
+  would leave benches on screen that may have been reaped while the socket was
+  down, which is precisely the confidently-wrong view this whole page exists to
+  replace.
+-->
+<style>
+  :root{
+    --bg:#15171E; --panel:#1C1F27; --panel2:#20242E; --line:#31364226;
+    --ink:#F0EFEA; --muted:#9B99A3; --faint:#6D6C75;
+    --ok:#6FD3AC;   --ok-bg:#12291F;
+    --busy:#8FB0FF; --busy-bg:#1B2540;
+    --warn:#F7C453; --warn-bg:#2E2510;
+    --bad:#FF8DA8;  --bad-bg:#301A22;
+    --lineS:#2E323D;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+       -webkit-font-smoothing:antialiased;}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+  /* ── header ── */
+  header{display:flex;align-items:center;gap:18px;padding:14px 26px;
+         border-bottom:1px solid var(--lineS);background:var(--panel)}
+  .brand{font-size:19px;font-weight:700;letter-spacing:.02em}
+  .brand span{color:var(--muted);font-weight:400}
+  .live{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ok);font-weight:600}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
+  .live.down{color:var(--faint)}
+  .live.down .dot{background:var(--faint);box-shadow:none}
+  .sum{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+  .sumchip{font-size:12px;color:var(--muted);border:1px solid var(--lineS);border-radius:6px;
+           padding:3px 10px;background:var(--panel2)}
+  .sumchip b{color:var(--ink);font-weight:600}
+
+  /* hidden until the WS drops */
+  #disconnected{display:none;background:var(--bad-bg);color:var(--bad);border-bottom:1px solid var(--bad);
+                padding:8px 26px;font-weight:700;letter-spacing:.04em}
+  #disconnected.show{display:block}
+
+  /* ── layout ── */
+  main{display:grid;grid-template-columns:1fr 380px;gap:22px;padding:22px 26px;max-width:1560px}
+  h2{font-size:12px;font-weight:700;letter-spacing:.12em;color:var(--faint);margin:0 0 10px;text-transform:uppercase}
+
+  /* ── bench cards ── */
+  .benches{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .bench{background:var(--panel);border:1px solid var(--lineS);border-radius:12px;padding:14px 16px}
+  .bench.off{border-color:#5A2733;background:#1B161B}
+  .bhead{display:flex;align-items:baseline;gap:10px;margin-bottom:10px}
+  .bname{font-size:16.5px;font-weight:700}
+  .beat{font-size:11.5px;color:var(--faint);margin-left:auto}
+  .load{font-size:11.5px;color:var(--muted)}
+  .chip{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.05em;border-radius:5px;
+        padding:2px 8px;border:1px solid}
+  .c-ok{color:var(--ok);background:var(--ok-bg);border-color:#2A5943}
+  .c-busy{color:var(--busy);background:var(--busy-bg);border-color:#33477A}
+  .c-warn{color:var(--warn);background:var(--warn-bg);border-color:#5E4A1A}
+  .c-bad{color:var(--bad);background:var(--bad-bg);border-color:#5E2D3C}
+  .dev{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:8px;
+       background:var(--panel2);margin-top:6px;font-size:13px;
+       border-left:3px solid transparent}
+  /* the row itself is tinted by state — the word still carries the state, the tint reinforces */
+  .dev.free{background:var(--ok-bg);border-left-color:var(--ok)}
+  .dev.busy{background:var(--busy-bg);border-left-color:var(--busy)}
+  .dev.resv{background:var(--warn-bg);border-left-color:var(--warn)}
+  .dev.unh {background:var(--warn-bg);border-left-color:var(--warn)}  /* unhealthy — agent's own report */
+  .dev.quar{background:var(--bad-bg); border-left-color:var(--bad)}   /* quarantined — TSS's verdict */
+  .dev.gone{background:#1A1D24;border-left-color:#3A3E48}
+  .dev .id{font-weight:600;min-width:52px}
+  .dev .cap{color:var(--faint);font-size:11px}
+  .dev .st{margin-left:auto;font-weight:700;font-size:12px;text-align:right}
+  .st.free{color:var(--ok)} .st.busy{color:var(--busy)} .st.resv{color:var(--warn)}
+  .st.unh{color:var(--warn)}
+  .st.quar{color:var(--bad)} .st.gone{color:var(--faint)}
+  .offnote{margin-top:9px;font-size:12px;color:var(--bad)}
+  .empty{color:var(--faint);font-size:13px;padding:6px 0}
+
+  /* ── jobs ── */
+  .jobs{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:22px}
+  .jcard{background:var(--panel);border:1px solid var(--lineS);border-radius:12px;padding:14px 16px}
+  .jrow{padding:9px 0;border-top:1px solid var(--lineS)}
+  .jrow:first-of-type{border-top:none}
+  .jname{font-weight:700;font-size:14.5px}
+  .jid{color:var(--faint);font-weight:400}
+  .jmeta{font-size:12px;color:var(--muted);margin-top:3px}
+  .jmeta b{color:var(--ink);font-weight:600}
+  .bar{height:6px;border-radius:3px;background:#2A2E38;margin-top:7px;overflow:hidden}
+  .bar i{display:block;height:100%;border-radius:3px;background:var(--busy)}
+  .why{font-size:12px;margin-top:4px;color:var(--warn)}
+  .why.wait{color:var(--muted)}
+  .why.bad{color:var(--bad)}
+
+  /* ── events ── */
+  aside{background:var(--panel);border:1px solid var(--lineS);border-radius:12px;padding:14px 16px;align-self:start}
+  /* kind column sizes to the longest kind on screen — long kinds must never overflow */
+  aside{display:grid;grid-template-columns:max-content max-content 1fr;column-gap:8px}
+  aside h2{grid-column:1 / -1}
+  aside .empty{grid-column:1 / -1}
+  .ev{display:grid;grid-template-columns:subgrid;grid-column:1 / -1;padding:7px 0;
+      border-top:1px solid var(--lineS);font-size:12.5px;align-items:baseline}
+  .ev:first-of-type{border-top:none}
+  .ev .t{color:var(--faint);font-size:11px}
+  .ev .k{font-weight:700;font-size:11.5px}
+  .k.ok{color:var(--ok)} .k.busy{color:var(--busy)} .k.warn{color:var(--warn)} .k.bad{color:var(--bad)} .k.mut{color:var(--muted)}
+  .ev .d{color:var(--muted)} .ev .d b{color:var(--ink);font-weight:600}
+
+  /* ── state key ── */
+  .legend{margin:0 26px;max-width:1508px;background:var(--panel);border:1px solid var(--lineS);
+          border-radius:12px;padding:12px 16px}
+  .lrow{display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:4px 0;font-size:12px}
+  .lcap{width:56px;color:var(--faint);font-size:10.5px;text-transform:uppercase;
+        letter-spacing:.08em;font-weight:700}
+  .lhint{color:var(--faint);font-size:11px;margin-right:8px}
+  .c-mut{color:var(--muted);background:var(--panel2);border-color:var(--lineS)}
+
+  footer{padding:10px 26px 20px;font-size:11.5px;color:var(--faint)}
+</style>
+</head>
+<body>
+
+<div id="disconnected">DISCONNECTED — reconnecting… the view will re-snapshot when the service returns</div>
+
+<header>
+  <div class="brand">TSS <span>· fleet</span></div>
+  <div class="live" id="live"><span class="dot"></span>LIVE</div>
+  <div class="sum" id="sum"></div>
+</header>
+
+<main>
+  <section>
+    <h2>Fleet</h2>
+    <div class="benches" id="benches"></div>
+    <div class="jobs">
+      <div class="jcard"><h2 id="running-h">Running</h2><div id="running"></div></div>
+      <div class="jcard"><h2 id="queued-h">Queued</h2><div id="queued"></div></div>
+    </div>
+  </section>
+
+  <aside>
+    <h2>Events</h2>
+    <div id="events"></div>
+  </aside>
+</main>
+
+<section class="legend">
+  <div class="lrow"><span class="lcap">bench</span>
+    <span class="chip c-ok">ONLINE</span>
+    <span class="chip c-warn">DRAINING</span><span class="lhint">finishing its jobs, taking nothing new</span>
+    <span class="chip c-bad">OFFLINE</span><span class="lhint">not heartbeating — may come back by itself</span>
+    <span class="chip c-bad">QUARANTINED</span><span class="lhint">TSS refuses it — cleared by an operator or a new agent version</span>
+  </div>
+  <div class="lrow"><span class="lcap">device</span>
+    <span class="chip c-ok">free</span>
+    <span class="chip c-busy">BUSY</span>
+    <span class="chip c-warn">RESERVED</span><span class="lhint">still free — held for a waiting job</span>
+    <span class="chip c-warn">unhealthy</span><span class="lhint">the bench's own report, withdrawable</span>
+    <span class="chip c-bad">QUARANTINED</span><span class="lhint">TSS's verdict — 3 infra errors in a row</span>
+    <span class="chip c-mut">freed</span><span class="lhint">bench offline</span>
+    <span class="chip c-mut">retired</span><span class="lhint">gone from inventory</span>
+  </div>
+  <div class="lrow"><span class="lcap">job</span>
+    <span class="chip c-mut">queued</span>
+    <span class="chip c-busy">running</span>
+    <span class="chip c-ok">passed</span>
+    <span class="chip c-warn">infra_error</span><span class="lhint">environment's fault — retried elsewhere</span>
+    <span class="chip c-bad">failed</span><span class="lhint">a real result — never auto-retried</span>
+    <span class="chip c-bad">dead_letter</span><span class="lhint">gave up after repeated infra errors</span>
+    <span class="chip c-mut">cancelled</span>
+  </div>
+</section>
+
+<footer>read-only · pushed over WS /v1/events — snapshot, then deltas · the same feed tss watch renders</footer>
+
+<script>
+"use strict";
+
+// ─────────────────────────────────────────────────────────── client state
+// Everything below is derived from what arrived on the socket. It is REPLACED
+// by a snapshot and DROPPED on a disconnect — never merged across one.
+let fleet = null;
+let queue = null;
+let events = [];
+let names = {};      // job_id -> name, learned from snapshots, kept after a job
+                     // leaves the queue so a completed-job event can still be
+                     // read as a name. The event itself carries only the id.
+let skew = 0;        // server clock minus browser clock, in seconds
+let connected = false;
+
+const EVENTS_SHOWN = 12;
+const EVENTS_KEPT = 200;
+const SHORT_ID_CHARS = 5;   // must match tss.core.models.SHORT_ID_CHARS
+
+function reset() { fleet = null; queue = null; events = []; names = {}; }
+
+// ───────────────────────────────────────────────────────────── formatting
+function h(value) {
+  return String(value === null || value === undefined ? "" : value)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function shortId(jobId) {
+  const i = String(jobId).indexOf("-");
+  const suffix = i === -1 ? String(jobId) : String(jobId).slice(i + 1);
+  return (suffix || String(jobId)).slice(0, SHORT_ID_CHARS);
+}
+// Humans read names, machines read ids: `smoke-1 (2bb76)` everywhere on screen,
+// the full id only on the wire.
+function jobHtml(jobId, name) {
+  const known = name || names[jobId];
+  const id = `<span class="jid mono">(${h(shortId(jobId))})</span>`;
+  return known ? `<b>${h(known)}</b> ${id}` : id;
+}
+function local(resourceId) {
+  const i = String(resourceId).indexOf(":");
+  return i === -1 ? String(resourceId) : String(resourceId).slice(i + 1);
+}
+function serverNow() { return Date.now() / 1000 + skew; }
+function ago(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 90) return s + "s";
+  if (s < 5400) return Math.round(s / 60) + "m";
+  return Math.round(s / 3600) + "h";
+}
+function clockTime(unix) {
+  return new Date(unix * 1000).toTimeString().slice(0, 8);
+}
+function specText(spec) {
+  return Object.keys(spec)
+    .map((k) => (k === "product" ? String(spec[k]) : k + "=" + String(spec[k])))
+    .join(" ");
+}
+function matchesSpec(device, spec) {
+  return Object.keys(spec).every((k) => device.capabilities[k] === spec[k]);
+}
+function matchesAny(device, specs) {
+  return specs.some((spec) => matchesSpec(device, spec));
+}
+
+// ────────────────────────────────────────────────────────────── rendering
+function render() {
+  const agents = (fleet && fleet.agents) || [];
+  const running = (queue && queue.running) || [];
+  const queued = (queue && queue.queued) || [];
+  const now = serverNow();
+
+  // Which devices are being withheld, and for whom. A reservation leaves the
+  // device FREE with no owner — it exists only in the scheduler's head — so the
+  // device row cannot know about it; the queue entry is what carries it.
+  const heldBy = {};
+  for (const job of queued) {
+    for (const rid of job.reserving_resource_ids || []) heldBy[rid] = job;
+  }
+  const byId = {};
+  const devById = {};
+  for (const agent of agents) {
+    byId[agent.id] = agent;
+    for (const dev of agent.resources) devById[dev.id] = dev;
+  }
+
+  document.getElementById("live").className = connected ? "live" : "live down";
+  document.getElementById("live").lastChild.textContent = connected ? "LIVE" : "OFFLINE";
+  document.getElementById("disconnected").className = connected ? "" : "show";
+
+  renderSummary(agents, running, queued, heldBy);
+  document.getElementById("benches").innerHTML =
+    agents.length
+      ? agents.map((a) => benchCard(a, heldBy, now)).join("")
+      : `<div class="empty">no benches registered — start one with <span class="mono">just agent bench-01 2</span></div>`;
+
+  document.getElementById("running-h").textContent = `Running · ${running.length}`;
+  document.getElementById("queued-h").textContent = `Queued · ${queued.length}`;
+  document.getElementById("running").innerHTML =
+    running.map((j) => runningRow(j, now)).join("") || `<div class="empty">nothing running</div>`;
+  document.getElementById("queued").innerHTML =
+    queued.map((j) => queuedRow(j, byId, devById, heldBy, now)).join("") ||
+    `<div class="empty">queue empty</div>`;
+  document.getElementById("events").innerHTML =
+    events.slice(0, EVENTS_SHOWN).map(eventRow).join("") ||
+    `<div class="empty">waiting for events…</div>`;
+}
+
+function renderSummary(agents, running, queued, heldBy) {
+  let online = 0, busy = 0, free = 0, reserved = 0, quarantined = 0, unhealthy = 0, offline = 0;
+  for (const agent of agents) {
+    if (agent.state === "online" || agent.state === "draining") online += 1;
+    for (const dev of agent.resources) {
+      if (agent.state === "offline") { offline += 1; continue; }
+      if (dev.state === "retired") continue;
+      if (dev.state === "busy") busy += 1;
+      // TSS's verdict and the bench's own report are counted apart: one needs an
+      // operator, the other may clear itself on the next heartbeat.
+      else if (dev.quarantined_at) quarantined += 1;
+      else if (dev.state === "unhealthy") unhealthy += 1;
+      else if (heldBy[dev.id]) reserved += 1;
+      else free += 1;
+    }
+  }
+  const devices = [`<b>${busy}</b> busy`, `<b>${reserved}</b> reserved`, `<b>${free}</b> free`];
+  if (quarantined) devices.push(`<b>${quarantined}</b> quarantined`);
+  if (unhealthy) devices.push(`<b>${unhealthy}</b> unhealthy`);
+  if (offline) devices.push(`<b>${offline}</b> offline`);
+  document.getElementById("sum").innerHTML =
+    `<span class="sumchip"><b>${agents.length}</b> benches · <b>${online}</b> online</span>` +
+    `<span class="sumchip">${devices.join(" · ")} devices</span>` +
+    `<span class="sumchip"><b>${running.length}</b> running · <b>${queued.length}</b> queued</span>`;
+}
+
+const BENCH_CHIP = {
+  online: ["c-ok", "ONLINE"],
+  draining: ["c-warn", "DRAINING"],
+  offline: ["c-bad", "OFFLINE"],
+  quarantined: ["c-bad", "QUARANTINED"],
+};
+
+function beatText(agent, now) {
+  const age = now - agent.last_heartbeat_at;
+  if (agent.state === "offline") return `last beat ${ago(age)} ago`;
+  // Heartbeats are not events — putting one on the bus per beat per bench would
+  // drown the feed that matters — so this page only learns of a beat when
+  // something else causes a snapshot. On a busy fleet that is constant and the
+  // relative age is honest; on a quiet one it would silently grow into a lie
+  // about a bench that is beating fine. Past the lease window it stops counting
+  // and states the last beat it actually saw, which is true either way.
+  const ttl = Math.max(1, agent.presence_expires_at - agent.last_heartbeat_at);
+  return age <= ttl ? `beat ${ago(age)} ago` : `beat ${clockTime(agent.last_heartbeat_at)}`;
+}
+
+function benchCard(agent, heldBy, now) {
+  const [chipClass, word] = BENCH_CHIP[agent.state] || ["c-mut", String(agent.state).toUpperCase()];
+  const down = agent.state === "offline" || agent.state === "quarantined";
+  const devices = agent.resources.filter((d) => d.state !== "retired");
+  const busy = devices.filter((d) => d.state === "busy").length;
+  const reserved = devices.filter((d) => heldBy[d.id]).length;
+  const sick = devices.filter((d) => d.state === "unhealthy").length;
+
+  let load;
+  if (agent.state === "offline") load = "—";
+  else {
+    load = `load ${busy}/${devices.length}`;
+    if (reserved) load += ` · ${reserved} reserved`;
+    if (sick) load += ` · ${sick} unhealthy`;
+  }
+
+  let note = "";
+  const requeued = agent.requeued_on_last_reap || [];
+  if (agent.state === "offline") {
+    note = `presence expired — ${requeued.length} job${requeued.length === 1 ? "" : "s"} requeued`;
+  } else if (agent.state === "quarantined") {
+    const since = agent.quarantined_at ? ` since ${clockTime(agent.quarantined_at)}` : "";
+    note = `quarantined${since} — ${agent.consecutive_fails} infra error` +
+           `${agent.consecutive_fails === 1 ? "" : "s"} · tss unquarantine ${agent.id} to clear`;
+  }
+
+  return `<div class="bench${down ? " off" : ""}">
+    <div class="bhead">
+      <span class="bname mono">${h(agent.id)}</span>
+      <span class="chip ${chipClass}">${h(word)}</span>
+      <span class="beat">${h(beatText(agent, now))}</span>
+    </div>
+    <div class="load">${h(load)}</div>
+    ${devices.length
+      ? devices.map((d) => deviceRow(d, agent, heldBy)).join("")
+      : `<div class="empty">no devices</div>`}
+    ${note ? `<div class="offnote">${h(note)}</div>` : ""}
+  </div>`;
+}
+
+function deviceRow(device, agent, heldBy) {
+  const cap = specText(device.capabilities || {});
+  let cls = "free", state = "free";
+  if (agent.state === "offline") {
+    // I5: an offline bench's devices are all free and hold no job. The word is
+    // "freed" rather than "free" because it says what happened to them.
+    cls = "gone"; state = "freed";
+  } else if (device.state === "busy") {
+    cls = "busy"; state = `BUSY · ${jobHtml(device.current_job_id)}`;
+  } else if (device.quarantined_at) {
+    // TSS's verdict, not the bench's report — only an operator clears it (§4.2).
+    cls = "quar";
+    state = `QUARANTINED · ${device.consecutive_fails} infra error${device.consecutive_fails === 1 ? "" : "s"}`;
+  } else if (device.state === "unhealthy") {
+    cls = "unh"; state = "unhealthy";
+  } else if (device.state === "retired") {
+    cls = "gone"; state = "retired";
+  } else if (heldBy[device.id]) {
+    const job = heldBy[device.id];
+    cls = "resv"; state = `free · RESERVED for ${jobHtml(job.job_id, job.name)}`;
+  } else if (agent.state === "quarantined") {
+    cls = "gone"; state = "held";
+  }
+  return `<div class="dev ${cls}"><span class="id mono">${h(device.local_id)}</span>` +
+         `<span class="cap">${h(cap)}</span>` +
+         `<span class="st ${cls}">${state}</span></div>`;
+}
+
+function runningRow(job, now) {
+  // Recomputed locally from `started_at`, never re-fetched. `elapsed_s` in the
+  // snapshot is the same number as of the snapshot; this is what lets the bar
+  // move between events without the page ever asking the server anything.
+  const elapsed = job.started_at === null || job.started_at === undefined
+    ? job.elapsed_s || 0
+    : now - job.started_at;
+  const pct = Math.max(0, Math.min(100, (elapsed / job.max_duration_s) * 100));
+  const devices = (job.resource_ids || []).map(local).join(" · ");
+  return `<div class="jrow">
+    <div class="jname">${jobHtml(job.job_id, job.name)}</div>
+    <div class="jmeta"><b>${h(job.agent_id || "—")}</b>${devices ? " · " + h(devices) : ""} · ` +
+    `${ago(elapsed)} of ${h(job.max_duration_s)}s budget${job.state === "assigned" ? " · starting" : ""}</div>
+    <div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div>
+  </div>`;
+}
+
+function queuedRow(job, byId, devById, heldBy, now) {
+  const waited = job.submitted_at === undefined ? job.waited_s : now - job.submitted_at;
+  const specs = (job.requirements || []).map(specText);
+  const unique = specs.filter((s, i) => specs.indexOf(s) === i);
+  let needs = unique.length === 1
+    ? `${job.resource_count} × ${unique[0]}`
+    : unique.join(" + ");
+  let meta = `needs <b>${h(needs)}</b>`;
+  if (job.resource_count > 1) meta += ", all on one bench";
+  meta += ` · waited ${ago(waited)}`;
+  const tried = job.tried_agents || [];
+  if (tried.length) meta += ` · requeued from ${h(tried[tried.length - 1])}`;
+  return `<div class="jrow">
+    <div class="jname">${jobHtml(job.job_id, job.name)}</div>
+    <div class="jmeta">${meta}</div>
+    ${whyLine(job, byId, devById, heldBy)}
+  </div>`;
+}
+
+function whyLine(job, byId, devById, heldBy) {
+  if (job.reserving_on) {
+    // The non-obvious answer to "why am I waiting" once jobs need several
+    // devices — and nine times out of ten the thing that looks like a scheduler
+    // bug is this, working correctly.
+    const held = (job.reserving_resource_ids || []).map(local);
+    const bench = byId[job.reserving_on];
+    const waitingOn = bench
+      ? bench.resources
+          .filter((d) => d.state === "busy" && matchesAny(d, job.requirements))
+          .map((d) => d.local_id)
+      : [];
+    let text = `RESERVING on ${job.reserving_on}`;
+    if (held.length) text += ` — ${held.join(", ")} held for this job`;
+    if (waitingOn.length) text += `${held.length ? ";" : " —"} waiting on ${waitingOn.join(", ")} to free`;
+    return `<div class="why">${h(text)}</div>`;
+  }
+  if (job.blocked_reason === "no_capable_agent") {
+    return `<div class="why bad">UNSATISFIABLE — no bench in the fleet can run this</div>`;
+  }
+  const want = (job.requirements || []).map(specText)[0] || "a device";
+  let text = `waiting — no free ${want}`;
+  const blockers = [];
+  for (const rid of Object.keys(heldBy)) {
+    const other = heldBy[rid];
+    if (other.job_id === job.job_id) continue;
+    // Only a device this job could actually have used explains anything. A
+    // reserved asset gateway is not why a vehicle-gateway job is waiting.
+    if (devById[rid] && !matchesAny(devById[rid], job.requirements)) continue;
+    blockers.push(`${local(rid)} is reserved by ${other.name}`);
+  }
+  if (blockers.length) text += ` (${blockers.join(", ")})`;
+  else if (job.blocked_reason) text += ` · ${job.blocked_reason}`;
+  return `<div class="why wait">${h(text)}</div>`;
+}
+
+// ── the feed ──────────────────────────────────────────────────────────────
+const EVENT_TONE = {
+  "agent.offline": "bad", "agent.quarantined": "bad", "job.dead_letter": "bad",
+  "job.unsatisfiable": "bad", "resource.quarantined": "bad",
+  "job.requeued": "warn", "job.timed_out": "warn", "agent.draining": "warn",
+  "job.cancelled": "warn",
+  "job.assigned": "busy", "job.started": "busy",
+  "job.completed": "ok", "agent.registered": "ok",
+  "agent.unquarantined": "ok", "resource.unquarantined": "ok",
+};
+
+function eventRow(event) {
+  const tone = EVENT_TONE[event.kind] || "mut";
+  return `<div class="ev"><span class="t mono">${h(clockTime(event.ts))}</span>` +
+         `<span class="k ${tone}">${h(event.kind)}</span>` +
+         `<span class="d">${eventDetail(event)}</span></div>`;
+}
+
+function eventDetail(event) {
+  const d = event.detail || {};
+  const who = event.job_id ? jobHtml(event.job_id) : (event.agent_id ? `<b>${h(event.agent_id)}</b>` : "");
+  const on = event.job_id && event.agent_id ? ` on ${h(event.agent_id)}` : "";
+  switch (event.kind) {
+    case "agent.registered":
+      return `${who} — ${(d.resources || []).length} device(s)` +
+             ((d.requeued || []).length ? ` · ${d.requeued.length} job(s) requeued` : "");
+    case "agent.offline":
+      return `${who} — ${h(d.reason || "presence expired")} · ${(d.requeued || []).length} job(s) requeued` +
+             ` · ${(d.freed_resources || []).length} device(s) freed`;
+    case "agent.draining":
+      return `${who} — finishing ${(d.finishing || []).length}, ${(d.requeued || []).length} requeued`;
+    case "agent.quarantined":
+      return `${who} — ${h(d.consecutive_fails)} infra errors across ${(d.devices || []).length} device(s)`;
+    case "resource.quarantined":
+    case "resource.unquarantined":
+      return `<b>${h(event.resource_id ? local(event.resource_id) : "")}</b>` +
+             `${event.agent_id ? ` on ${h(event.agent_id)}` : ""}` +
+             (event.kind === "resource.quarantined"
+               ? ` — ${h(d.consecutive_fails)} infra errors in a row`
+               : ` — back in rotation`);
+    case "job.assigned":
+      return `${who} → ${h(event.agent_id || "")} · ${(d.resource_ids || []).map(local).join(", ")}`;
+    case "job.started":
+      return `${who}${on}`;
+    case "job.completed":
+      return `${who} — ${h(d.outcome || "")}`;
+    case "job.timed_out":
+      return `${who} — ${h(Math.round(d.elapsed_s || 0))}s of a ${h(d.max_duration_s)}s budget`;
+    case "job.requeued":
+    case "job.dead_letter":
+      return `${who} — ${h(d.reason || "")}${d.epoch ? ` · epoch ${h(d.epoch)}` : ""}`;
+    case "job.cancelled":
+      return `${who} — ${d.was_running ? "was running" : "before it started"}`;
+    case "job.unsatisfiable":
+      return `${who} — ${h(d.reason || "")}`;
+    default:
+      return `${who}${on}`;
+  }
+}
+
+// ────────────────────────────────────────────────────────── the socket
+function apply(message) {
+  if (message.type === "snapshot") {
+    fleet = message.fleet;
+    queue = message.queue;
+    // The browser clock is not the server clock, and every duration on this page
+    // is derived from a server timestamp. One offset, refreshed on every
+    // snapshot, keeps them in the same frame of reference.
+    if (fleet && typeof fleet.now === "number") skew = fleet.now - Date.now() / 1000;
+    for (const job of (queue.running || []).concat(queue.queued || [])) names[job.job_id] = job.name;
+  } else if (message.type === "event") {
+    events.unshift(message.event);
+    if (events.length > EVENTS_KEPT) events.length = EVENTS_KEPT;
+  }
+}
+
+function connect(backoff) {
+  const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${scheme}//${location.host}/v1/events`);
+  // Reset by a successful connection, so an hour of uptime followed by a blip
+  // reconnects in half a second rather than in whatever the last outage
+  // happened to have backed off to.
+  let delay = backoff;
+
+  socket.onopen = function () { connected = true; delay = 0; render(); };
+  socket.onmessage = function (message) { apply(JSON.parse(message.data)); render(); };
+  socket.onerror = function () { socket.close(); };
+  socket.onclose = function () {
+    connected = false;
+    // THROW EVERYTHING AWAY. Anything learned on the old connection may have
+    // been contradicted while the socket was down — a bench reaped, a job
+    // finished — and a view that is confidently out of date is worse than one
+    // that admits it. The next snapshot rebuilds the whole page from scratch.
+    reset();
+    render();
+    const next = Math.min(delay ? delay * 2 : 500, 8000);
+    setTimeout(function () { connect(next); }, next);
+  };
+}
+
+// The ONLY timer on this page. It re-derives elapsed, waited and "ago" from
+// state already in hand; it sends nothing and asks for nothing. Polling would
+// make the demo a second late and the push pointless.
+setInterval(render, 1000);
+render();
+connect(0);
+</script>
+
+</body>
+</html>

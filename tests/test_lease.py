@@ -400,6 +400,7 @@ def test_a_cancel_directive_reaches_the_agent_and_stops_the_run(dispatch_server,
             assert cancelled.json() == {
                 "cancelled": True,
                 "job_id": job_id,
+                "name": "long",
                 "was_running": True,
             }
 

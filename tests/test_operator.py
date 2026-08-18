@@ -417,7 +417,7 @@ def test_the_fleet_view_spells_out_draining_and_quarantined():
 
     screen = FleetScreen("http://x")
     screen.apply({"type": "snapshot", "fleet": fleet, "queue": {"queued": [], "running": []}})
-    console.print(screen.render())
+    console.print(screen.render(40))
 
     rendered = console.export_text()
     assert rendered.count("DRAINING") >= 2, "both surfaces must say it, not just colour it"

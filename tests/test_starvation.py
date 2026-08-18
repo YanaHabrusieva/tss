@@ -553,3 +553,29 @@ def test_timing_the_release_over_a_running_scheduler(store, db_path, config):
 
     assert elapsed is not None, "the withheld device was never offered to anyone else"
     assert elapsed < 0.5, f"took {elapsed:.2f}s — that is a stale reservation idling hardware"
+
+
+def test_the_queue_view_says_which_devices_a_reservation_is_withholding(store, scheduler, config):
+    """`reserving_on` names the bench. "RESERVING on bench-01" without "vg-02
+    held" is the half of the sentence that does not answer the question — and
+    the device row itself cannot answer it, because a reserved device is FREE
+    and owned by nobody. The reservation lives in the scheduler's head, so the
+    queue entry is the only place it can surface.
+    """
+    from tss.api.client import queue_view
+
+    reserved_bench = bench(store, "bench-01", devices=2)
+    occupy(store, "bench-01", reserved_bench[:1])
+    submit(store, "job-big", 2, now=T0, caps=VG)
+
+    tick(scheduler, store, T0 + STARVED)
+    view = queue_view(store, scheduler, now=T0 + STARVED)
+
+    entry = next(j for j in view.queued if j.job_id == "job-big")
+    assert entry.reserving_on == "bench-01"
+    assert entry.reserving_resource_ids == reserved_bench[1:], (
+        "the queue named a bench but not the device being withheld on it"
+    )
+    # ...and it is still free and still nobody's, which is the whole point.
+    assert store.get_resource(reserved_bench[1]).state == ResourceState.FREE
+    assert store.get_resource(reserved_bench[1]).current_job_id is None

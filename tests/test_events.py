@@ -331,3 +331,49 @@ def test_the_watch_screen_renders_an_empty_fleet_and_a_full_one():
     assert "OFFLINE" in rendered, "state must be readable without colour"
     assert "RESERVING on bench-01" in rendered
     assert "ONE BENCH" in rendered
+
+
+def test_an_event_committed_while_the_snapshot_is_being_sent_is_not_lost(
+    dispatch_server, monkeypatch
+):
+    """SUBSCRIBE FIRST, THEN SNAPSHOT.
+
+    Building and sending the snapshot takes long enough for a claim to commit,
+    and if the subscription is created afterwards everything published in that
+    window goes to nobody. On a fleet that then falls quiet — which is exactly
+    what a fleet does between jobs — `tss watch` shows stale state indefinitely,
+    the precise failure the snapshot exists to prevent.
+
+    The window is a real race, so it is constructed rather than hoped for: the
+    snapshot builder publishes through the store's own hook, which is the same
+    call a committing transaction makes.
+    """
+    base, _config = dispatch_server
+    ws_url = base.replace("http://", "ws://")
+
+    import tss.api.ws as ws_module
+
+    real_snapshot = ws_module.snapshot
+    marker = Event(ts=1.0, kind="job.assigned", job_id="job-during-snapshot")
+
+    def snapshot_that_races(store, scheduler):
+        frame = real_snapshot(store, scheduler)
+        if store.publish is not None:
+            store.publish([marker])  # ...committed while this frame was in flight
+        return frame
+
+    monkeypatch.setattr(ws_module, "snapshot", snapshot_that_races)
+
+    async def scenario():
+        async with websockets.connect(f"{ws_url}/v1/events") as socket:
+            first = json.loads(await socket.recv())
+            second = json.loads(await asyncio.wait_for(socket.recv(), timeout=5))
+            return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first["type"] == "snapshot"
+    assert second["type"] == "event"
+    assert second["event"]["job_id"] == "job-during-snapshot", (
+        "an event published while the snapshot was in flight went to nobody"
+    )

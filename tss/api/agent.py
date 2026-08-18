@@ -16,7 +16,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from tss.api.deps import (
     get_config,
@@ -28,7 +28,14 @@ from tss.api.deps import (
 from tss.core.config import Config
 from tss.core.directives import DirectiveQueue
 from tss.core.fence import SilentJobTracker
-from tss.core.models import AgentState, Assignment, InventoryItem, Outcome, PresenceStatus
+from tss.core.models import (
+    AgentState,
+    Assignment,
+    InventoryItem,
+    Outcome,
+    PresenceStatus,
+    check_identifier,
+)
 from tss.core.scheduler import Scheduler
 from tss.core.store import DETAIL_UNREPORTED, Store
 
@@ -52,6 +59,25 @@ class RegisterRequest(BaseModel):
     #: Inventory is PUSHED by the machine that can actually see the hardware —
     #: never read from a central config file (§3.1).
     resources: list[InventoryItem] = Field(default_factory=list)
+
+    @field_validator("agent_id")
+    @classmethod
+    def _valid_agent_id(cls, value: str) -> str:
+        # An empty id registers happily and then 404s on every heartbeat forever,
+        # re-registering every three seconds against a row that cannot be found.
+        return check_identifier(value, what="agent_id")
+
+    @field_validator("resources")
+    @classmethod
+    def _no_duplicate_devices(cls, resources: list[InventoryItem]) -> list[InventoryItem]:
+        # The inventory upsert is keyed on the qualified id, so duplicates
+        # collapse last-wins: the bench reports two devices and ends up with one,
+        # while the register response and the daemon both go on counting two.
+        seen = [item.id for item in resources]
+        duplicates = sorted({device for device in seen if seen.count(device) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate device ids in one inventory: {duplicates}")
+        return resources
 
 
 class RegisterResponse(BaseModel):
@@ -86,14 +112,20 @@ class HeartbeatResponse(BaseModel):
     directives: list[Any] = Field(default_factory=list)
 
 
+#: SQLite stores integers in 64 bits and raises OverflowError past 2^63-1, which
+#: would surface as a 500 for what is plainly a bad request. Epochs are
+#: self-incremented one at a time, so this ceiling is unreachable in practice.
+MAX_EPOCH = 2**62
+
+
 class StartRequest(BaseModel):
     agent_id: str
-    epoch: int
+    epoch: int = Field(ge=0, le=MAX_EPOCH)
 
 
 class CompleteRequest(BaseModel):
     agent_id: str
-    epoch: int
+    epoch: int = Field(ge=0, le=MAX_EPOCH)
     outcome: Outcome
     detail: str | None = None
     duration_s: float | None = None
@@ -105,6 +137,16 @@ async def register(
 ) -> RegisterResponse:
     """Register a bench and its inventory. Idempotent — re-registering replaces
     the inventory in place and never duplicates a device (§6)."""
+    previous = store.get_agent(req.agent_id)
+    if previous is not None and previous.hostname != req.hostname:
+        # Authn is deferred and named as deferred (§1.4). Until it lands, a bench
+        # id moving to a different machine is at least not silent.
+        log.warning(
+            "%s is re-registering from a different hostname: %s -> %s",
+            req.agent_id,
+            previous.hostname,
+            req.hostname,
+        )
     result = store.register_agent(
         req.agent_id,
         req.hostname,

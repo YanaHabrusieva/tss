@@ -12,7 +12,7 @@ import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from tss.api.deps import get_config, get_directives, get_scheduler, get_store
 from tss.core import matcher
@@ -39,15 +39,62 @@ DirectivesDep = Annotated[DirectiveQueue, Depends(get_directives)]
 ConfigDep = Annotated[Config, Depends(get_config)]
 
 
+#: One day. Long enough for any HIL test anyone has described; short enough that a
+#: typo cannot pin a device until someone notices.
+MAX_JOB_DURATION_S = 86_400
+
+
 class SubmitRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
     #: A LIST of tag-subsets, one per device needed (§3.4). Modelling it this way
     #: from the first commit is what lets "a heavy-duty VG AND an AG on the same
     #: bench" be expressible later without reshaping the schema.
     requirements: list[CapabilitySpec]
     payload: dict[str, Any] = Field(default_factory=dict)
-    priority: int = 100
-    max_duration_s: int | None = None
+    priority: int = Field(default=100, ge=0, le=1000)
+    #: `0` would start, be killed by the next timeout sweep, and be recorded as
+    #: `infra_error` — the fleet blamed for the caller's input, which is the one
+    #: thing the FAILED/INFRA_ERROR split exists to prevent (§4.3).
+    max_duration_s: int | None = Field(default=None, gt=0, le=MAX_JOB_DURATION_S)
+
+    @field_validator("requirements")
+    @classmethod
+    def _scalar_spec_values(cls, requirements: list[CapabilitySpec]) -> list[CapabilitySpec]:
+        """A spec value must be a scalar, and must not be null.
+
+        `{"product": null}` matches EVERY device that lacks the key, because the
+        subset test compares `capabilities.get(k) == v` and `.get` returns None
+        for an absent key. A typo'd null silently widens the match to the whole
+        fleet instead of narrowing it — the job runs on the wrong hardware and
+        nothing anywhere reports a problem.
+        """
+        for spec in requirements:
+            for key, value in spec.items():
+                if value is None:
+                    raise ValueError(
+                        f"requirement {key!r} is null, which would match every device "
+                        "that lacks that capability"
+                    )
+                if not isinstance(value, str | int | float | bool):
+                    raise ValueError(
+                        f"requirement {key!r} must be a scalar, got {type(value).__name__}"
+                    )
+        return requirements
+
+    @field_validator("payload")
+    @classmethod
+    def _sane_duration(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        """The bench reads `duration_s` to decide how long to hold the hardware.
+        A non-numeric one reaches the agent, kills the task, and the job burns
+        its whole budget twice before dead-lettering as an infra error."""
+        if "duration_s" not in payload:
+            return payload
+        duration = payload["duration_s"]
+        if isinstance(duration, bool) or not isinstance(duration, int | float):
+            raise ValueError(f"payload.duration_s must be a number, got {duration!r}")
+        if duration < 0:
+            raise ValueError(f"payload.duration_s must not be negative, got {duration!r}")
+        return payload
 
 
 class SubmitResponse(BaseModel):

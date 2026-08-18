@@ -34,7 +34,17 @@ class ExecutionResult:
 
 async def execute(job_id: str, resource_ids: list[str], payload: dict[str, Any]) -> ExecutionResult:
     """Hold the devices for a while, then report. Never raises."""
-    duration = float(payload.get("duration_s", DEFAULT_DURATION_S))
+    try:
+        duration = float(payload.get("duration_s", DEFAULT_DURATION_S))
+        if duration < 0:
+            raise ValueError(f"negative duration_s: {duration}")
+    except (TypeError, ValueError) as exc:
+        # The safety net behind the API's validation, for an older client or a
+        # hand-rolled POST. FAILED, not infra_error: this job cannot run as
+        # written, and retrying it on two more benches before blaming the fleet
+        # is exactly the misattribution the split exists to prevent (§4.3).
+        log.warning("%s has an unusable payload (%s); reporting FAILED", job_id, exc)
+        return ExecutionResult("failed", f"bad_payload: {exc}", 0.0)
     outcome = str(payload.get("outcome", "passed"))
     detail = payload.get("detail")
 

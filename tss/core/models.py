@@ -17,7 +17,7 @@ import sqlite3
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AgentState(StrEnum):
@@ -197,12 +197,37 @@ class ClaimResult(BaseModel):
         return self.ok
 
 
+#: Characters an id may not contain. `:` is the separator `qualify()` uses, so a
+#: device locally named "bench-01:vg-01" on agent "bench-01" would qualify to the
+#: same row as a plain "vg-01" — two physical devices silently merged into one.
+#: A `:` in an AGENT id also misroutes `tss unquarantine`, which uses it to tell a
+#: device id from a bench id. `/` would land inside URL paths.
+FORBIDDEN_IN_IDS = (":", "/")
+
+
+def check_identifier(value: str, *, what: str) -> str:
+    """Agent and device ids are structural: they become row keys and URL paths."""
+    if not value or not value.strip():
+        raise ValueError(f"{what} must not be empty")
+    if value != value.strip():
+        raise ValueError(f"{what} must not have leading or trailing whitespace: {value!r}")
+    for character in FORBIDDEN_IN_IDS:
+        if character in value:
+            raise ValueError(f"{what} must not contain {character!r}: {value!r}")
+    return value
+
+
 class InventoryItem(BaseModel):
     """One device, as the agent reports it (§6). `id` is bench-local ("vg-01");
     TSS qualifies it to "bench-sf-04:vg-01" so ids are unique fleet-wide."""
 
     id: str
     capabilities: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("id")
+    @classmethod
+    def _valid_id(cls, value: str) -> str:
+        return check_identifier(value, what="device id")
 
 
 class PresenceStatus(StrEnum):

@@ -62,12 +62,20 @@ async def events(
     websocket: WebSocket, store: StoreDep, bus: BusDep, scheduler: SchedulerDep
 ) -> None:
     await websocket.accept()
-    try:
-        await websocket.send_json(snapshot(store, scheduler))
-    except (WebSocketDisconnect, RuntimeError):
-        return
 
+    # SUBSCRIBE FIRST, THEN SNAPSHOT. Building and sending the snapshot takes
+    # long enough for a claim to commit, and anything published in that window is
+    # lost to this client if the subscription comes after — on a fleet that then
+    # goes quiet, `tss watch` shows state that is stale indefinitely, which is
+    # the exact failure mode the snapshot exists to prevent. Subscribing first
+    # can duplicate an event that is also reflected in the snapshot; a repeated
+    # line in the event log is not a problem, and a missing one is.
     async with bus.subscription() as queue:
+        try:
+            await websocket.send_json(snapshot(store, scheduler))
+        except (WebSocketDisconnect, RuntimeError):
+            return
+
         pending_refresh = False
         try:
             while True:

@@ -410,6 +410,12 @@ async def drain(agent_id: str, store: StoreDep, scheduler: SchedulerDep):
             status_code=409, detail=f"{agent_id} is {result.split(':', 1)[1]}, not online"
         )
     scheduler.notify()  # its devices are out of the pool now
+    # ...and release the bench's in-flight long-poll so it hears about this on
+    # THIS beat rather than up to LONGPOLL_TIMEOUT later. The drain directive is
+    # derived from state rather than queued, so unlike a cancel nothing wakes the
+    # agent as a side effect of pushing it — a bench would keep taking work it is
+    # not supposed to take for another eight seconds.
+    scheduler.wake_agent(agent_id)
     return {"draining": True, "agent_id": agent_id}
 
 

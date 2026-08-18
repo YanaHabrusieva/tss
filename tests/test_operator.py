@@ -302,8 +302,14 @@ def test_drain_reaches_the_agent_and_it_finishes_and_exits(dispatch_server, db_p
                 assert time.monotonic() < deadline
                 await asyncio.sleep(0.02)
 
+            began = time.monotonic()
             drained = await client.post(f"/v1/agents/{agent.agent_id}/drain")
             assert drained.status_code == 200
+            # It must hear about it on this beat, not when its long-poll times
+            # out: a bench that does not know it is draining keeps taking work.
+            while not agent.draining and time.monotonic() - began < 5:
+                await asyncio.sleep(0.02)
+            told_in = time.monotonic() - began
 
             # It must NOT be handed anything else...
             await client.post(
@@ -319,11 +325,15 @@ def test_drain_reaches_the_agent_and_it_finishes_and_exits(dispatch_server, db_p
                 await asyncio.sleep(0.05)
             fleet = (await client.get("/v1/fleet")).json()
             queue = (await client.get("/v1/queue")).json()
-            return job, fleet, queue, agent.draining
+            return job, fleet, queue, agent.draining, told_in
 
-    job, fleet, queue, draining = asyncio.run(scenario())
+    job, fleet, queue, draining, told_in = asyncio.run(scenario())
 
     assert draining is True, "the daemon never saw the directive"
+    assert told_in < 1.0, (
+        f"the bench took {told_in:.1f}s to learn it was draining — that is a long-poll "
+        "timeout, not a wake-up, and it keeps accepting work until it lands"
+    )
     assert job["state"] == "passed", "a drained bench's result is accepted, not fenced"
     assert fleet["agents"][0]["state"] == "draining"
     assert [j["name"] for j in queue["queued"]] == ["next"], "the new job waits for another bench"

@@ -68,20 +68,30 @@ JSON
 
 ### The short way
 
-Three recipes exist so a demo needs one terminal instead of four:
+Four recipes, so the whole demo runs in **one** terminal:
 
 ```bash
-just start                      # opens http://127.0.0.1:8000/ and serves in the FOREGROUND
-just add bench-sf-01 2 0        # a bench with 2 vehicle gateways, in the background
+just start                      # service in the background, live page in the browser
+just add bench-sf-01 2 0        # a bench with 2 vehicle gateways
 just add bench-ag-01 1 2        # 1 vehicle gateway + 2 asset gateways
 just kill bench-sf-01           # stop that bench — watch it go OFFLINE
+just stop                       # stop everything and delete the demo's state
 ```
 
-`just add NAME VG AG` writes the inventory for you and backgrounds the daemon, with its output in
-`.demo-logs/NAME.log` so the terminal stays readable. `just start` runs the service in the
-foreground, so **Ctrl-C still stops it**, and sets `TSS_STARVATION_THRESHOLD_S=5` — the demo
-setting. Production is 60s; five seconds is simply short enough to stand in front of while a
-multi-device job waits to reserve.
+`just start` backgrounds the service, waits until it answers, opens
+<http://127.0.0.1:8000/>, and tells you where the log is. Started twice it says so and opens
+the page again rather than stacking a second scheduler onto the same port. If the service
+fails to come up it says that too, with the tail of `.demo-logs/serve.log` — a broken start is
+never silent. It sets `TSS_STARVATION_THRESHOLD_S=5`, the demo setting: production is 60s, and
+five seconds is simply short enough to stand in front of while a multi-device job waits to
+reserve.
+
+Nothing runs in the foreground any more, so **`just stop` is the stop path** — it kills the
+benches and the service, and deletes `tss.db` and `.demo-logs/`. It is safe to run cold, and
+safe to run twice.
+
+`just add NAME VG AG` writes the inventory for you and backgrounds the daemon, with its output
+in `.demo-logs/NAME.log` so the terminal stays readable.
 
 **Then submit work and watch it.**
 

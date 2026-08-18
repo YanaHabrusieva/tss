@@ -43,12 +43,61 @@ serve PORT="8000":
 agent ID="bench-sf-01" DEVICES="3":
     {{py}} -m tss.agent.daemon --id {{ID}} --devices {{DEVICES}}
 
-# The demo: open the web view, then run the service in the FOREGROUND (Ctrl-C stops it).
+# Start the service in the BACKGROUND and open the live page. `just stop` stops it.
 start PORT="8000":
-    @(sleep 1; open http://127.0.0.1:{{PORT}}/ || xdg-open http://127.0.0.1:{{PORT}}/ || true) >/dev/null 2>&1 &
-    @# 5s is the DEMO starvation threshold, not production: 60s is right on a real
-    @# fleet and far too long to stand in front of while a big job waits to reserve.
-    TSS_STARVATION_THRESHOLD_S=5 {{py}} -m uvicorn tss.api.app:app --host 127.0.0.1 --port {{PORT}}
+    #!/usr/bin/env bash
+    set -uo pipefail
+    url="http://127.0.0.1:{{PORT}}/"
+
+    # Poll until the service answers, or give up. One process, not one per attempt.
+    wait_up() {
+        {{py}} - "$1" "$2" <<'PY' 2>/dev/null
+    import sys, time, urllib.request
+    url, deadline = sys.argv[1], time.time() + float(sys.argv[2])
+    while True:
+        try:
+            urllib.request.urlopen(url, timeout=1)
+            sys.exit(0)
+        except Exception:
+            if time.time() >= deadline:
+                sys.exit(1)
+            time.sleep(0.2)
+    PY
+    }
+    browse() { open "$1" >/dev/null 2>&1 || xdg-open "$1" >/dev/null 2>&1 || true; }
+
+    # A second `just start` must never stack another uvicorn onto the same port:
+    # two schedulers and two reapers on one database is a demo that fails in a way
+    # nobody can explain from the screen.
+    if wait_up "$url" 0; then
+        echo "TSS already running at $url"
+        browse "$url"
+        exit 0
+    fi
+
+    mkdir -p .demo-logs
+    # 5s is the DEMO starvation threshold, not production: 60s is right on a real
+    # fleet and far too long to stand in front of while a big job waits to reserve.
+    TSS_STARVATION_THRESHOLD_S=5 nohup {{py}} -m uvicorn tss.api.app:app \
+        --host 127.0.0.1 --port {{PORT}} >> .demo-logs/serve.log 2>&1 &
+
+    if ! wait_up "$url" 15; then
+        echo "WARNING: TSS did not answer at $url within 15s. Last lines of the log:" >&2
+        tail -n 8 .demo-logs/serve.log >&2 || true
+        exit 1
+    fi
+    browse "$url"
+    echo "TSS is running at $url — log: .demo-logs/serve.log — stop it with: just stop"
+
+# Stop everything and delete the demo's state. Safe to run cold.
+stop:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    pkill -f "tss.agent.daemon" || true
+    pkill -f "uvicorn tss.api.app:app" || true
+    rm -f tss.db tss.db-wal tss.db-shm bench.json
+    rm -rf .demo-logs
+    echo "demo stopped — benches and service killed, database and logs removed."
 
 # Add a bench in the BACKGROUND: `just add bench-sf-01 2 1` -> vg-01 vg-02 ag-01.
 add NAME VG="2" AG="0":

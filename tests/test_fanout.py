@@ -174,3 +174,53 @@ def test_a_terminal_job_is_never_resurrected_by_a_reap(store, reap, loaded_bench
     assert job.state == JobState.PASSED
     assert job.outcome == "passed"
     assert job.epoch == loaded_bench["job-Y"].epoch, "a terminal job's epoch must not move"
+
+
+def test_a_one_bench_fleet_cannot_ping_pong_a_job_forever(store, reap, config):
+    """Poison detection counts DISTINCT benches, which is right — three failures
+    across three machines means the job is the problem, not the fleet. But on a
+    one-bench fleet that count never passes 1, so a job that keeps coming back
+    returns to the same bench forever and never reaches a terminal state (I3).
+
+    Presence expiry is the path that shows it plainly: a bench that keeps dying
+    and rebooting requeues the job every time, and nothing here touches
+    `consecutive_fails`, so quarantine attribution never intervenes to end it.
+
+    The backstop is a LIVENESS bound, not an attribution rule — `tried_agents`
+    still decides who is to blame, and one bench is still blamed once.
+    """
+    store.register_agent("bench-only", "b.local", inventory(1), now=T0)
+    submit(store, "job-forever", 1)
+
+    for cycle in range(config.max_total_attempts + 2):
+        if store.get_job("job-forever").state == JobState.DEAD_LETTER:
+            break
+        now = T0 + cycle * 100
+        store.register_agent("bench-only", "b.local", inventory(1), now=now)
+        assert store.claim_all("job-forever", "bench-only", ["bench-only:vg-01"], now=now).ok
+        reap(store, "bench-only", now=now + config.presence_ttl_s + 1)
+
+    job = store.get_job("job-forever")
+    assert job.state == JobState.DEAD_LETTER, "it would have gone round forever"
+    assert job.outcome == Outcome.INFRA_ERROR, "never outcome='dead_letter' — that is a state"
+    assert job.attempt >= config.max_total_attempts
+    assert job.result_detail.endswith("attempts"), (
+        "the record must say it ran out of attempts, not out of benches"
+    )
+    assert set(job.tried_agents) == {"bench-only"}, "one bench tried, one bench blamed"
+
+
+def test_the_distinct_bench_rule_still_ends_it_first_on_a_real_fleet(store, reap, config):
+    """The backstop must not preempt the attribution rule. Three benches, three
+    failures: it dead-letters on DISTINCT benches at attempt 3, well before the
+    total-attempts bound."""
+    submit(store, "job-poison", 1)
+    for i, bench_id in enumerate(["bench-a", "bench-b", "bench-c"]):
+        store.register_agent(bench_id, f"{bench_id}.local", inventory(1), now=T0 + i)
+        assert store.claim_all("job-poison", bench_id, [f"{bench_id}:vg-01"], now=T0 + i).ok
+        reap(store, bench_id, now=T0 + i + config.presence_ttl_s + 1)
+
+    job = store.get_job("job-poison")
+    assert job.state == JobState.DEAD_LETTER
+    assert job.attempt == 3 < config.max_total_attempts
+    assert job.result_detail.endswith("benches"), "attribution, not exhaustion, ended this one"

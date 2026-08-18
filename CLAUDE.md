@@ -76,6 +76,13 @@ Any change that could violate one of these needs a test proving it doesn't.
 - `tried_agents` is appended at CLAIM time only, never on requeue — the bench is recorded when it
   takes the job; appending again on the way out counts one bench twice. Poison detection counts
   DISTINCT entries (`len(set(...))`), not list length.
+- Every sweep and claim revalidates its trigger condition inside the transaction; the pre-read is
+  advisory. `reap_agent` rechecks the lease, `time_out_job` rechecks the deadline, `claim_all`
+  rechecks that the bench is online with a live lease. Unreachable with one event loop, real the day
+  a second writer exists — which is the stated Postgres path.
+- The fence works in both directions. A job an agent reports but no longer owns is rejected by the
+  epoch; a job an agent OWNS but stops reporting for 2 consecutive heartbeats is requeued. Only
+  presence expiry would otherwise notice, and that needs the whole bench to die.
 - Agent health and device health are separate. One bad device does not take the machine offline.
 - Presence timeout and job timeout are different things and must never be collapsed.
 
@@ -87,7 +94,10 @@ Any change that could violate one of these needs a test proving it doesn't.
   inside one process only, never for a column — it resets on restart and would break recovery.
 - Background loops (reaper, health) wrap their body in `try/except`, log, and continue. A background
   task must never die silently.
-- Retry and poison decisions key off `tried_agents` (distinct benches), not `attempt`.
+- Retry and poison decisions key off `tried_agents` (distinct benches), not `attempt`. `attempt`
+  carries one job: a total-attempts backstop (`MAX_TOTAL_ATTEMPTS`) dead-letters regardless of
+  distinctness, because a one-bench fleet never raises the distinct count past 1. Liveness bound,
+  not attribution.
 - `FAILED` is terminal and never auto-retried. Only `INFRA_ERROR` retries. A hung job is
   `infra_error:timeout`, never `failed`.
 - `state` says what happened; `outcome` says whose problem it is. A dead-lettered job is

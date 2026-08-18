@@ -32,6 +32,11 @@ class Config:
 
     # --- retry, poison, quarantine ------------------------------------------
     max_distinct_agents: int = 3  # distinct benches tried before DEAD_LETTER
+    #: Total dispatches before DEAD_LETTER, whatever the bench count. Poison
+    #: detection counts DISTINCT benches, which is right — but on a one-bench
+    #: fleet that count never passes 1 and an always-failing job ping-pongs
+    #: forever. Liveness bound, not attribution.
+    max_total_attempts: int = 6
     quarantine_threshold: int = 3  # consecutive failures
 
     # --- starvation and reservation (§3.4.1) --------------------------------

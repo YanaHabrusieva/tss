@@ -31,6 +31,28 @@ log = logging.getLogger("tss.agent")
 
 DEFAULT_URL = "http://127.0.0.1:8000"
 
+#: Grace on top of the job's own budget before the bench stops a run itself.
+#: TSS's job-timeout sweep should normally get there first; this is the backstop
+#: for when it cannot be heard.
+LOCAL_DEADLINE_MARGIN_S = 5.0
+
+
+def _parse(response: httpx.Response) -> dict | None:
+    """A 200 carrying a proxy error page is not a protocol error, and must not
+    be treated as one. `response.json()` raises JSONDecodeError — a ValueError,
+    not an httpx.HTTPError — so it sails past every `except httpx.HTTPError` and
+    kills the daemon. In exactly the NAT'd, proxied networks this design assumes
+    (§1.4), that takes a whole bench off the fleet."""
+    try:
+        return response.json()
+    except ValueError:
+        log.warning(
+            "unparseable %s response from TSS (%d bytes); treating as a failed beat",
+            response.status_code,
+            len(response.content),
+        )
+        return None
+
 
 class TestbedAgent:
     """One machine, several devices cabled to it."""
@@ -43,6 +65,7 @@ class TestbedAgent:
         base_url: str = DEFAULT_URL,
         hostname: str | None = None,
         agent_version: str = "0.1.0",
+        client: httpx.AsyncClient | None = None,
     ) -> None:
         self.agent_id = agent_id
         self.inventory = inventory
@@ -64,6 +87,8 @@ class TestbedAgent:
         #: then exit. The operator restarts the daemon after maintenance and it
         #: re-registers clean (§4.1).
         self.draining = False
+        #: Injectable so the loop can be driven against a scripted server.
+        self._client = client
 
     async def register(self, client: httpx.AsyncClient) -> None:
         response = await client.post(
@@ -76,7 +101,9 @@ class TestbedAgent:
             },
         )
         response.raise_for_status()
-        body = response.json()
+        body = _parse(response)
+        if body is None:
+            return
         self.heartbeat_interval_s = body["heartbeat_interval_s"]
         self.presence_ttl_s = body["presence_ttl_s"]
         self.longpoll_timeout_s = body.get("longpoll_timeout_s", 8.0)
@@ -110,22 +137,28 @@ class TestbedAgent:
             # We lost ONE job — cancelled, timed out, or reassigned while we were
             # partitioned. Everything else on this bench is untouched, so this is
             # not a re-registration: drop that run and carry on.
-            lost = response.json().get("job_id")
+            lost = (_parse(response) or {}).get("job_id")
             self.abandon(lost, why="lease_lost")
             return None
         if response.status_code in (404, 410):
             # 404 unknown_agent / 410 presence_expired. Both mean the same thing
             # to us: TSS no longer believes in this bench. Re-register and come
             # back clean — we do not get our jobs back, and must not pretend to.
-            reason = response.json().get("error", response.status_code)
+            reason = (_parse(response) or {}).get("error", response.status_code)
             log.warning("%s -> re-registering", reason)
             self.registered = False
+            # Cancel, do not merely forget. Clearing `running` without stopping
+            # the tasks leaves those executions physically driving devices TSS
+            # has already re-issued to another bench. The epoch keeps the stale
+            # RESULT out; only this keeps the stale RUN out.
+            for job_id in list(self._tasks):
+                self.abandon(job_id, why=str(reason))
             self.running.clear()
             self._tasks.clear()
             await self.register(client)
             return None
         response.raise_for_status()
-        return response.json()
+        return _parse(response)
 
     # --- the two seams a mock bench needs. Both are real agent responsibilities
     # (§11 lists executor.py and health.py separately); overriding them is how the
@@ -179,9 +212,22 @@ class TestbedAgent:
                 # Fenced out before we even began — someone else owns this now.
                 log.warning("start %s rejected (%s); abandoning", job_id, started.status_code)
                 return
-            result = await self.execute_job(
-                job_id, assignment["resource_ids"], assignment["payload"]
-            )
+            # THE DAEMON HOLDS ITS OWN DEADLINE. TSS's sweep 2 frees these
+            # devices at the same moment, but a partitioned agent never hears
+            # about that and no directive can reach it — so without this it
+            # drives hardware unboundedly while TSS hands that hardware to
+            # somebody else. The margin lets the server's cancel land first when
+            # the two are actually in contact.
+            budget = float(assignment.get("max_duration_s") or 0) or None
+            if budget:
+                result = await asyncio.wait_for(
+                    self.execute_job(job_id, assignment["resource_ids"], assignment["payload"]),
+                    timeout=budget + LOCAL_DEADLINE_MARGIN_S,
+                )
+            else:
+                result = await self.execute_job(
+                    job_id, assignment["resource_ids"], assignment["payload"]
+                )
             done = await client.post(
                 f"{self.base_url}/v1/jobs/{job_id}/complete",
                 json={
@@ -195,6 +241,15 @@ class TestbedAgent:
                 # The zombie case: our lease died while we were running. Release
                 # the hardware locally and drop the result on the floor.
                 log.warning("complete %s fenced out (stale epoch); abandoning", job_id)
+        except TimeoutError:
+            # Past its budget. TSS has already given up on this run, so there is
+            # nothing worth reporting — and reporting would race whoever owns the
+            # job now.
+            log.warning(
+                "%s ran past its %ss budget — abandoning locally, reporting nothing",
+                job_id,
+                assignment.get("max_duration_s"),
+            )
         except asyncio.CancelledError:
             # A cancel directive, or shutdown. Do NOT report: this run was
             # abandoned, and its result is not ours to give.
@@ -209,7 +264,12 @@ class TestbedAgent:
 
     async def run(self, stop: asyncio.Event | None = None) -> None:
         stop = stop or asyncio.Event()
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # Only close a client we made. A crashed bench reboots by calling this
+        # again, and closing an injected one would leave it holding a dead
+        # transport on the way back up.
+        owned = self._client is None
+        client = self._client or httpx.AsyncClient(timeout=30.0)
+        try:
             while not stop.is_set():
                 began = time.monotonic()  # in-process duration only (§3.3)
                 try:
@@ -249,6 +309,9 @@ class TestbedAgent:
 
             for task in list(self._tasks.values()):
                 task.cancel()
+        finally:
+            if owned:
+                await client.aclose()
 
     async def _wait_for_next_beat(self, stop: asyncio.Event, timeout: float) -> None:
         """Sit out the rest of the heartbeat interval — unless a job just ended.

@@ -174,13 +174,13 @@ def test_i4_checks_history_per_attempt_not_per_job(store):
     `job_resources`. Checked as one set they are not even co-located — the check
     has to group by attempt."""
     claim = bench_with_job(store)
-    store.reap_agent("bench-01", now=T0 + 10)
+    store.reap_agent("bench-01", now=T0 + 100)  # past its lease, or nothing happens
     from tss.core.models import InventoryItem
 
     store.register_agent(
-        "bench-02", "b.local", [InventoryItem(id="vg-01", capabilities=VG)], now=T0 + 11
+        "bench-02", "b.local", [InventoryItem(id="vg-01", capabilities=VG)], now=T0 + 101
     )
-    assert store.claim_all("job-A", "bench-02", ["bench-02:vg-01"], now=T0 + 11).ok
+    assert store.claim_all("job-A", "bench-02", ["bench-02:vg-01"], now=T0 + 101).ok
     assert len(store.allocation_records("job-A")) == 2
 
     fleet = [

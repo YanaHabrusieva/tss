@@ -14,6 +14,7 @@ from starlette.requests import HTTPConnection
 from tss.core.config import Config
 from tss.core.directives import DirectiveQueue
 from tss.core.events import EventBus
+from tss.core.fence import SilentJobTracker
 from tss.core.scheduler import Scheduler
 from tss.core.store import Store
 
@@ -36,3 +37,7 @@ def get_directives(connection: HTTPConnection) -> DirectiveQueue:
 
 def get_bus(connection: HTTPConnection) -> EventBus:
     return connection.app.state.bus
+
+
+def get_silent_jobs(connection: HTTPConnection) -> SilentJobTracker:
+    return connection.app.state.silent_jobs

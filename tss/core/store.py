@@ -57,12 +57,17 @@ REASON_JOB_NOT_QUEUED = "job_not_queued"
 REASON_RESOURCE_COUNT_MISMATCH = "resource_count_mismatch"
 REASON_UNKNOWN_JOB = "unknown_job"
 REASON_DB_BUSY = "db_busy"
+#: offline, quarantined, draining, or the lease lapsed between decision and claim
+REASON_AGENT_NOT_LIVE = "agent_not_live"
 
 # --- result_detail tokens. Every terminal record LEADS with one of these, so the
 # record says which path ended the job — that is what makes I6 checkable (§3.8).
 DETAIL_TIMEOUT = "timeout"  # sweep 2: the job hung, the bench was fine
 DETAIL_PRESENCE = "presence_expired"  # sweep 1: the machine died
 DETAIL_CANCELLED = "cancelled_by_client"
+DETAIL_DRAINED = "agent_draining"  # taken back because the bench had not started it
+#: the bench is alive and heartbeating but has stopped mentioning this job
+DETAIL_UNREPORTED = "unreported_by_agent"
 #: `blocked_reason` on a queued job nobody in the fleet can run (§3.4.1).
 BLOCKED_NO_CAPABLE_AGENT = "no_capable_agent"
 DETAIL_REREGISTERED = "agent_reregistered"
@@ -349,6 +354,22 @@ class Store:
                         blocked_by=resource_id,
                     )
 
+            # The matcher read the fleet a moment ago; this commits now. A bench
+            # that went offline, was quarantined or drained, or simply let its
+            # lease lapse in between must not be handed devices — so the
+            # condition the decision rested on is checked again here, inside the
+            # transaction that acts on it.
+            if not conn.execute(
+                """SELECT 1 FROM agents
+                    WHERE id = :agent_id AND state = 'online'
+                      AND presence_expires_at > :now""",
+                {"agent_id": agent_id, "now": now},
+            ).fetchone():
+                self._rollback(conn)
+                return ClaimResult(
+                    ok=False, job_id=job_id, agent_id=agent_id, reason=REASON_AGENT_NOT_LIVE
+                )
+
             cur = conn.execute(
                 _CLAIM_JOB_SQL,
                 {
@@ -533,7 +554,15 @@ class Store:
                 )
 
             resource_ids = [qualify(agent_id, item.id) for item in inventory]
-            retired = self._replace_inventory(conn, agent_id, inventory, keep=set(resource_ids))
+            retired = self._replace_inventory(
+                conn,
+                agent_id,
+                inventory,
+                keep=set(resource_ids),
+                # A new build is the one thing that clears a device verdict too:
+                # somebody deployed a fix, so the old evidence is about old code.
+                keep_quarantine=existing is not None and existing["agent_version"] == agent_version,
+            )
 
             self._insert_event(
                 conn,
@@ -571,6 +600,7 @@ class Store:
         inventory: Sequence[InventoryItem],
         *,
         keep: set[str],
+        keep_quarantine: bool = True,
     ) -> list[str]:
         """Upsert what the agent reports; retire what it no longer does.
 
@@ -596,18 +626,35 @@ class Store:
             retired.append(resource_id)
 
         for item in inventory:
+            # A device TSS quarantined keeps its verdict across a re-register,
+            # for the same reason an agent does (§4.2): rebooting the bench is
+            # the first thing anyone tries, and a restart is not a repair. Only a
+            # new agent_version or `tss unquarantine` clears it.
             conn.execute(
                 """INSERT INTO resources (id, agent_id, capabilities, state)
                         VALUES (:id, :agent_id, :capabilities, 'free')
                    ON CONFLICT(id) DO UPDATE
                           SET capabilities   = excluded.capabilities,
                               agent_id       = excluded.agent_id,
-                              state          = 'free',
+                              state          = CASE
+                                  WHEN resources.quarantined_at IS NOT NULL AND :keep_quarantine
+                                      THEN resources.state
+                                  ELSE 'free'
+                              END,
+                              quarantined_at = CASE
+                                  WHEN :keep_quarantine THEN resources.quarantined_at
+                                  ELSE NULL
+                              END,
+                              consecutive_fails = CASE
+                                  WHEN :keep_quarantine THEN resources.consecutive_fails
+                                  ELSE 0
+                              END,
                               current_job_id = NULL""",
                 {
                     "id": qualify(agent_id, item.id),
                     "agent_id": agent_id,
                     "capabilities": json.dumps(item.capabilities),
+                    "keep_quarantine": 1 if keep_quarantine else 0,
                 },
             )
         return retired
@@ -663,8 +710,13 @@ class Store:
                     "resource.unhealthy",
                 )
             elif status in (ResourceState.FREE, "healthy"):
+                # Only a fault the AGENT reported is the agent's to withdraw. A
+                # device TSS quarantined after repeated failures carries
+                # `quarantined_at`, and a bench announcing itself healthy is not
+                # an appeal against that — `tss unquarantine` is.
                 sql, kind = (
-                    "UPDATE resources SET state = 'free' WHERE id = ? AND state = 'unhealthy'",
+                    """UPDATE resources SET state = 'free'
+                        WHERE id = ? AND state = 'unhealthy' AND quarantined_at IS NULL""",
                     "resource.healthy",
                 )
             else:
@@ -879,11 +931,23 @@ class Store:
         conn.execute("UPDATE agents SET consecutive_fails = 0 WHERE id = ?", (agent_id,))
 
         if len(implicated) >= 2:
-            conn.execute(
+            # `draining` is excluded: an operator's acknowledged order outranks
+            # automated blame. A bench draining for maintenance whose last jobs
+            # fail — often WHY it is being drained — would otherwise have the
+            # drain silently converted into a quarantine, and the reason would
+            # read as a verdict nobody chose.
+            quarantined = conn.execute(
                 """UPDATE agents SET state = 'quarantined', quarantined_at = :now
-                    WHERE id = :agent_id AND state NOT IN ('offline','quarantined')""",
+                    WHERE id = :agent_id
+                      AND state NOT IN ('offline','quarantined','draining')""",
                 {"now": now, "agent_id": agent_id},
             )
+            # The event follows the WRITE, not the intent. Emitting it anyway
+            # would put a quarantine in the audit log and on the live stream for
+            # a bench that is still draining — the log has to be able to explain
+            # the state, and here it would contradict it.
+            if quarantined.rowcount != 1:
+                return
             self._insert_event(
                 conn,
                 kind="agent.quarantined",
@@ -894,11 +958,13 @@ class Store:
             return
 
         for resource_id in implicated:
-            conn.execute(
+            marked = conn.execute(
                 """UPDATE resources SET state = 'unhealthy', quarantined_at = :now
                     WHERE id = :id AND state NOT IN ('retired','busy')""",
                 {"now": now, "id": resource_id},
             )
+            if marked.rowcount != 1:
+                continue
             self._insert_event(
                 conn,
                 kind="resource.quarantined",
@@ -962,13 +1028,17 @@ class Store:
         try:
             # Taking the agent offline is also this reap's claim on the work: a
             # second sweep racing us finds rowcount 0 and does nothing.
-            if (
-                conn.execute(
-                    "UPDATE agents SET state = 'offline' WHERE id = ? AND state != 'offline'",
-                    (agent_id,),
-                ).rowcount
-                != 1
-            ):
+            # REVALIDATE THE TRIGGER CONDITION. `expired_agents` was a SELECT;
+            # the bench can heartbeat between it and this UPDATE, and reaping it
+            # then frees devices from under a machine that is alive and running
+            # on them. The pre-read is advisory.
+            reaped = conn.execute(
+                """UPDATE agents SET state = 'offline'
+                    WHERE id = :agent_id AND state != 'offline'
+                      AND presence_expires_at < :now""",
+                {"agent_id": agent_id, "now": now},
+            )
+            if reaped.rowcount != 1:
                 self._rollback(conn)
                 return ReapResult(agent_id=agent_id)
 
@@ -1059,9 +1129,10 @@ class Store:
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute(
-                "SELECT agent_id, epoch, max_duration_s, started_at FROM jobs "
-                "WHERE id = ? AND state = 'running'",
-                (job_id,),
+                """SELECT agent_id, epoch, max_duration_s, started_at FROM jobs
+                    WHERE id = :job_id AND state = 'running'
+                      AND :now > started_at + max_duration_s""",
+                {"job_id": job_id, "now": now},
             ).fetchone()
             if row is None:
                 self._rollback(conn)
@@ -1112,6 +1183,43 @@ class Store:
             raise
         return kind
 
+    def jobs_owned_by(self, agent_id: str) -> list[str]:
+        """What TSS believes this bench is holding: assigned or running."""
+        return [
+            row["id"]
+            for row in self.conn.execute(
+                """SELECT id FROM jobs
+                    WHERE agent_id = ? AND state IN ('assigned','running')
+                    ORDER BY id""",
+                (agent_id,),
+            )
+        ]
+
+    def requeue_job(
+        self, job_id: str, *, agent_id: str, reason: str, now: float | None = None
+    ) -> str | None:
+        """Take one job back from a bench that is not running it — the inverse
+        fence's write (§3.5). Same transaction shape as the timeout sweep: bump
+        the epoch, close the allocation record, free that job's devices only."""
+        now = time.time() if now is None else now
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            kind = self._requeue_job(conn, job_id, agent_id=agent_id, now=now, reason=reason)
+            if kind is None:
+                self._rollback(conn)
+                return None
+            conn.execute(
+                """UPDATE resources SET state = 'free', current_job_id = NULL
+                    WHERE current_job_id = :job_id AND state = 'busy'""",
+                {"job_id": job_id},
+            )
+            self._commit(conn)
+        except BaseException:
+            self._rollback(conn)
+            raise
+        return kind
+
     # ---------------------------------------------------------- operator verbs
     def drain_agent(self, agent_id: str, *, now: float | None = None) -> str:
         """Finish what you are running, accept nothing new (§4.1).
@@ -1128,17 +1236,52 @@ class Store:
         being there.
         """
         now = time.time() if now is None else now
-        cur = self.conn.execute(
-            "UPDATE agents SET state = 'draining' WHERE id = ? AND state = 'online'",
-            (agent_id,),
-        )
-        if cur.rowcount != 1:
-            agent = self.get_agent(agent_id)
-            return "unknown_agent" if agent is None else f"not_online:{agent.state}"
-        running = self._distinct_jobs_on(self.conn, agent_id)
-        self.append_event(
-            "agent.draining", agent_id=agent_id, detail={"finishing": running}, now=now
-        )
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "UPDATE agents SET state = 'draining' WHERE id = ? AND state = 'online'",
+                (agent_id,),
+            )
+            if cur.rowcount != 1:
+                self._rollback(conn)
+                agent = self.get_agent(agent_id)
+                return "unknown_agent" if agent is None else f"not_online:{agent.state}"
+
+            # An assignment this bench has not started yet is limbo: it will be
+            # redelivered to a daemon that is draining and discarded, and the job
+            # then waits out presence expiry having burned an attempt for
+            # nothing. Take those back here, in the same transaction that turns
+            # the tap off — a job that never started is not "current work".
+            requeued = []
+            for job_id in self._distinct_jobs_on(conn, agent_id):
+                row = conn.execute("SELECT state FROM jobs WHERE id = ?", (job_id,)).fetchone()
+                if row is None or row["state"] != JobState.ASSIGNED:
+                    continue
+                if self._requeue_job(
+                    conn, job_id, agent_id=agent_id, now=now, reason=DETAIL_DRAINED
+                ):
+                    requeued.append(job_id)
+            if requeued:
+                placeholders = ",".join("?" * len(requeued))
+                conn.execute(
+                    f"""UPDATE resources SET state = 'free', current_job_id = NULL
+                         WHERE current_job_id IN ({placeholders}) AND state = 'busy'""",
+                    tuple(requeued),
+                )
+
+            finishing = self._distinct_jobs_on(conn, agent_id)
+            self._insert_event(
+                conn,
+                kind="agent.draining",
+                ts=now,
+                agent_id=agent_id,
+                detail={"finishing": finishing, "requeued": requeued},
+            )
+            self._commit(conn)
+        except BaseException:
+            self._rollback(conn)
+            raise
         return "draining"
 
     def unquarantine_agent(self, agent_id: str, *, now: float | None = None) -> str:
@@ -1386,7 +1529,16 @@ class Store:
         # separate rule — a job that hangs twice is hanging on its own, not
         # because of the bench, so it gets one retry rather than three (§7.2).
         benches_tried = len(set(json.loads(row["tried_agents"])))
-        if force_dead_letter or benches_tried >= self.config.max_distinct_agents:
+        # A one-bench fleet never raises the DISTINCT count past 1, so an
+        # always-failing job would return to the same bench forever and never
+        # reach a terminal state (I3). A liveness bound, not an attribution rule:
+        # `tried_agents` still decides who is to blame.
+        attempts_exhausted = int(row["attempt"]) >= self.config.max_total_attempts
+        if (
+            force_dead_letter
+            or attempts_exhausted
+            or benches_tried >= self.config.max_distinct_agents
+        ):
             # `state` says what happened; `outcome` says whose problem it is.
             # Dead-lettering only ever happens on the infra retry path — FAILED
             # is a real result and never retries (§4.2) — so the outcome is
@@ -1413,7 +1565,7 @@ class Store:
         # ended this attempt. That is what makes I6 checkable at all: a hung job
         # and a job on a dead bench are indistinguishable afterwards if both
         # write the same string (§3.8).
-        if force_dead_letter:
+        if force_dead_letter or attempts_exhausted:
             detail = f"{reason} after {int(row['attempt'])} attempts"
         elif benches_tried >= self.config.max_distinct_agents:
             detail = f"{reason} after {benches_tried} benches"

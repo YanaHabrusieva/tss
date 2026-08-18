@@ -195,3 +195,29 @@ def test_resource_updates_are_issued_in_sorted_order(store, bench, claim):
 
     issued = [r["resource_id"] for r in store.conn.execute("SELECT * FROM claim_order_log")]
     assert issued == sorted(bench), "resource UPDATEs must be issued sorted by resource_id"
+
+
+def test_the_claim_revalidates_the_agent_inside_the_transaction(store, bench, claim):
+    """The matcher read the fleet a moment ago; the claim commits now. An agent
+    that went offline, was quarantined, or let its lease lapse in between must
+    not be handed devices — the pre-read is advisory (CLAUDE.md, ownership)."""
+    import time as _time
+
+    now = _time.time()
+    store.conn.execute("UPDATE agents SET presence_expires_at = ? WHERE id = ?", (now - 1, AGENT))
+
+    result = claim(store, "job-3dev", AGENT, bench)
+
+    assert not result.ok, "devices were claimed on a bench whose lease had expired"
+    assert_nothing_held(store, sorted(bench), "job-3dev")
+
+
+def test_the_claim_refuses_a_quarantined_bench(store, bench, claim):
+    store.conn.execute(
+        "UPDATE agents SET state = 'quarantined', quarantined_at = 1 WHERE id = ?", (AGENT,)
+    )
+
+    result = claim(store, "job-3dev", AGENT, bench)
+
+    assert not result.ok
+    assert_nothing_held(store, sorted(bench), "job-3dev")

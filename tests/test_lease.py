@@ -454,3 +454,152 @@ def test_a_replayed_completion_is_rejected(store, outcome):
     assert second == "stale_epoch"
     assert store.get_job("job-A").finished_at == T0 + 5
     assert check_i7(store) == []
+
+
+# --------------------------------------------------------- the inverse fence
+def _beat(client, agent_id, running=()):
+    return client.post(
+        f"/v1/agents/{agent_id}/heartbeat",
+        json={
+            "running_jobs": [{"job_id": j, "epoch": e} for j, e in running],
+            "resource_health": {},
+        },
+    )
+
+
+async def _register(client, agent_id, devices=1):
+    response = await client.post(
+        "/v1/agents/register",
+        json={
+            "agent_id": agent_id,
+            "hostname": f"{agent_id}.local",
+            "agent_version": "0.1.0",
+            "resources": [
+                {"id": f"vg-{i:02d}", "capabilities": DEVICE_CAPS} for i in range(1, devices + 1)
+            ],
+        },
+    )
+    assert response.status_code == 200
+
+
+async def _assignment_for(client, agent_id, *, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        body = (await _beat(client, agent_id)).json()
+        if body["assignment"]:
+            return body["assignment"]
+    raise AssertionError(f"{agent_id} was never offered anything")
+
+
+@pytest.mark.parametrize(
+    ("name", "start_it"),
+    [("lost_start_response", False), ("lost_complete_response", True)],
+)
+def test_a_job_the_agent_stops_reporting_is_taken_back(dispatch_server, db_path, name, start_it):
+    """THE INVERSE FENCE.
+
+    The epoch fences what the agent DOES report. Nothing looks at what it fails
+    to report — and the two ways that happens are both ordinary network events:
+
+      * the /start response is lost, so the agent never learns it owns the job;
+      * the /complete response is lost, so the agent drops the job locally and
+        stops mentioning it while TSS still believes it is running.
+
+    Either way the job sits in `assigned`/`running` holding devices until
+    presence expiry, which only fires if the whole bench dies. The bench here is
+    perfectly healthy and heartbeating.
+    """
+    base, _config = dispatch_server
+    store = Store(db_path)
+
+    async def scenario():
+        async with httpx.AsyncClient(base_url=base, timeout=20.0) as client:
+            await _register(client, AGENT)
+            submitted = await client.post(
+                "/v1/jobs",
+                json={"name": name, "requirements": [{"product": "vehicle_gateway"}]},
+            )
+            job_id = submitted.json()["job_id"]
+            assignment = await _assignment_for(client, AGENT)
+            if start_it:
+                await client.post(
+                    f"/v1/jobs/{job_id}/start",
+                    json={"agent_id": AGENT, "epoch": assignment["epoch"]},
+                )
+            # ...and from here the agent never mentions it again.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                await _beat(client, AGENT)
+                job = (await client.get(f"/v1/jobs/{job_id}")).json()
+                if job["epoch"] > assignment["epoch"]:
+                    return job, assignment
+                await asyncio.sleep(0.05)
+            return (await client.get(f"/v1/jobs/{job_id}")).json(), assignment
+
+    job, assignment = asyncio.run(scenario())
+
+    # Asserted on the epoch and the audit log rather than on a glimpse of
+    # `queued`: the fleet here is one healthy bench, so the job is re-dispatched
+    # almost immediately and the queued state is a window a poll can miss.
+    assert job["epoch"] > assignment["epoch"], (
+        "a healthy, heartbeating bench held this job forever without ever running it"
+    )
+    requeues = [
+        e
+        for e in store.events(job_id=job["id"])
+        if e.kind == "job.requeued" and (e.detail or {}).get("reason") == "unreported_by_agent"
+    ]
+    assert len(requeues) == 1, "it must be taken back exactly once, and say why"
+    assert check_all(store) == []
+    store.close()
+
+
+def test_a_job_that_is_still_being_reported_is_left_alone(dispatch_server, db_path):
+    """The negative. A job can legitimately take a long time to say anything
+    interesting; what matters is that the bench keeps claiming it."""
+    base, _config = dispatch_server
+    store = Store(db_path)
+
+    async def scenario():
+        async with httpx.AsyncClient(base_url=base, timeout=20.0) as client:
+            await _register(client, AGENT)
+            await client.post(
+                "/v1/jobs",
+                json={"name": "slow", "requirements": [{"product": "vehicle_gateway"}]},
+            )
+            assignment = await _assignment_for(client, AGENT)
+            reported = [(assignment["job_id"], assignment["epoch"])]
+            for _ in range(8):  # many more beats than the miss threshold
+                assert (await _beat(client, AGENT, reported)).status_code == 200
+                await asyncio.sleep(0.02)
+            return (await client.get(f"/v1/jobs/{assignment['job_id']}")).json()
+
+    job = asyncio.run(scenario())
+
+    assert job["state"] in ("assigned", "running"), "a reported job must not be taken back"
+    assert job["agent_id"] == AGENT
+    store.close()
+
+
+def test_one_missed_beat_is_not_enough(dispatch_server, db_path):
+    """Two CONSECUTIVE misses. One beat that crosses in flight with a /start is
+    ordinary, and taking a job off a bench for it would be its own bug."""
+    base, _config = dispatch_server
+
+    async def scenario():
+        async with httpx.AsyncClient(base_url=base, timeout=20.0) as client:
+            await _register(client, AGENT)
+            await client.post(
+                "/v1/jobs",
+                json={"name": "flicker", "requirements": [{"product": "vehicle_gateway"}]},
+            )
+            assignment = await _assignment_for(client, AGENT)
+            job_id, epoch = assignment["job_id"], assignment["epoch"]
+            await _beat(client, AGENT)  # one miss...
+            await _beat(client, AGENT, [(job_id, epoch)])  # ...then it speaks up
+            await _beat(client, AGENT)  # miss again — the count restarted
+            return (await client.get(f"/v1/jobs/{job_id}")).json()
+
+    job = asyncio.run(scenario())
+
+    assert job["state"] in ("assigned", "running")

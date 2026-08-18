@@ -15,6 +15,7 @@ from tss.api import agent, client, ws
 from tss.core.config import Config
 from tss.core.directives import DirectiveQueue
 from tss.core.events import EventBus
+from tss.core.fence import SilentJobTracker
 from tss.core.reaper import Reaper
 from tss.core.scheduler import Scheduler
 from tss.core.store import Store
@@ -30,6 +31,7 @@ def create_app(config: Config | None = None, store: Store | None = None) -> Fast
     # A queued directive releases the agent's long-poll immediately.
     directives = DirectiveQueue(on_push=scheduler.wake_agent)
     bus = EventBus()
+    silent_jobs = SilentJobTracker()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -57,6 +59,7 @@ def create_app(config: Config | None = None, store: Store | None = None) -> Fast
     app.state.scheduler = scheduler
     app.state.directives = directives
     app.state.bus = bus
+    app.state.silent_jobs = silent_jobs
     app.include_router(agent.router)
     app.include_router(agent.job_router)
     app.include_router(client.router)

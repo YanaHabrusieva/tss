@@ -79,7 +79,7 @@ def test_re_registering_while_loaded_requeues_every_job_it_held(store):
     orphans those jobs forever, with no lease left to expire them."""
     register(store, devices=3)
     submit(store, "job-A", 2)
-    claimed = store.claim_all("job-A", AGENT, [f"{AGENT}:vg-01", f"{AGENT}:vg-02"])
+    claimed = store.claim_all("job-A", AGENT, [f"{AGENT}:vg-01", f"{AGENT}:vg-02"], now=T0)
     assert claimed.ok
 
     result = register(store, devices=3, now=T0 + 5)
@@ -270,7 +270,7 @@ def test_an_idle_bench_that_is_powered_off_still_goes_offline(store, reaper, con
 def test_a_loaded_bench_that_dies_frees_its_devices(store, reaper, config):
     register(store, devices=3)
     submit(store, "job-A", 2)
-    assert store.claim_all("job-A", AGENT, [f"{AGENT}:vg-01", f"{AGENT}:vg-02"]).ok
+    assert store.claim_all("job-A", AGENT, [f"{AGENT}:vg-01", f"{AGENT}:vg-02"], now=T0).ok
 
     results = reaper.sweep_presence(now=T0 + config.presence_ttl_s + 1)
 
@@ -300,7 +300,7 @@ def test_a_reaped_agent_cannot_renew_itself_back_to_life(store, reaper, config):
 def test_re_registering_after_a_reap_brings_the_bench_back_clean(store, reaper, config):
     register(store, devices=3)
     submit(store, "job-A", 1)
-    assert store.claim_all("job-A", AGENT, [f"{AGENT}:vg-01"]).ok
+    assert store.claim_all("job-A", AGENT, [f"{AGENT}:vg-01"], now=T0).ok
     reaper.sweep_presence(now=T0 + config.presence_ttl_s + 1)
 
     again = register(store, devices=3, now=T0 + 30)
@@ -422,3 +422,25 @@ def _wait_until(predicate, *, timeout: float, interval: float = 0.05) -> None:
             return
         time.sleep(interval)
     raise AssertionError(f"condition not met within {timeout}s")
+
+
+def test_the_reap_revalidates_the_lease_inside_the_transaction(store, config):
+    """The pre-read is advisory: `expired_agents` is a SELECT, and the agent can
+    heartbeat between it and the UPDATE. Reaping it then would free devices from
+    under a bench that is alive and running on them."""
+    register(store, devices=2)
+    submit(store, "job-A", 1)
+    claim = store.claim_all("job-A", AGENT, [f"{AGENT}:vg-01"], now=T0)
+    dead_at = T0 + config.presence_ttl_s + 1
+    assert store.expired_agents(now=dead_at) == [AGENT]
+
+    # ...and here is the beat that crossed in flight.
+    store.renew_presence(AGENT, now=dead_at)
+
+    result = store.reap_agent(AGENT, now=dead_at)
+
+    assert result.requeued_jobs == [], "a live bench was reaped on a stale read"
+    assert store.get_agent(AGENT).state == AgentState.ONLINE
+    assert store.get_job("job-A").state == JobState.ASSIGNED
+    assert store.get_job("job-A").epoch == claim.epoch
+    assert store.resources_held_by("job-A") == [f"{AGENT}:vg-01"]

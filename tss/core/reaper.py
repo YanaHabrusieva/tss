@@ -105,6 +105,11 @@ class Reaper:
                 agent_id,
                 "dead_letter" if kind == "job.dead_letter" else "requeued",
             )
+        if ended and self.on_reap is not None:
+            # This sweep frees devices exactly as sweep 1 does, so it owes the
+            # queue the same wake-up. Without it they idle until the backstop
+            # tick — correct, and dead for a second.
+            self.on_reap()
         return ended
 
     async def run(self) -> None:

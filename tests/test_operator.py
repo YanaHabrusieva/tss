@@ -412,3 +412,125 @@ def test_the_fleet_view_spells_out_draining_and_quarantined():
     rendered = console.export_text()
     assert rendered.count("DRAINING") >= 2, "both surfaces must say it, not just colour it"
     assert rendered.count("QUARANTINED") >= 2
+
+
+# ---------------------------------------------- post-review hardening (§4.1/4.2)
+def test_draining_takes_back_jobs_that_were_never_started(store, scheduler):
+    """An assignment the daemon has not started yet is limbo: it is redelivered
+    on the next heartbeat to a bench that is draining, which discards it. The job
+    then sits `assigned` until presence expiry takes it — having burned an
+    attempt and a bench, for nothing."""
+    devices = bench(store, devices=2)
+    submit(store, "job-started", 1, now=T0)
+    submit(store, "job-limbo", 1, now=T0)
+    started = store.claim_all("job-started", AGENT, devices[:1], now=T0)
+    store.start_job("job-started", AGENT, started.epoch, now=T0)
+    limbo = store.claim_all("job-limbo", AGENT, devices[1:], now=T0)
+    assert store.get_job("job-limbo").state == JobState.ASSIGNED
+
+    assert store.drain_agent(AGENT, now=T0 + 1) == "draining"
+
+    limbo_job = store.get_job("job-limbo")
+    assert limbo_job.state == JobState.QUEUED, "an unstarted assignment must come back"
+    assert limbo_job.epoch == limbo.epoch + 1
+    assert store.resources_held_by("job-limbo") == []
+    # ...and the one that IS running is left alone to finish.
+    assert store.get_job("job-started").state == JobState.RUNNING
+    assert store.resources_held_by("job-started") == devices[:1]
+    assert check_all(store, scheduler) == []
+
+
+def test_failures_during_a_drain_do_not_convert_it_to_quarantine(store):
+    """An operator's acknowledged order outranks automated blame.
+
+    A bench is drained for maintenance — often BECAUSE its jobs have been
+    failing — and the three runs it was already carrying now fail on the way
+    down. Attribution would quarantine the machine, and the operator's `tss
+    drain` would vanish from the fleet view, replaced by a verdict nobody chose
+    and a different way out (unquarantine, not a restart).
+    """
+    devices = bench(store, devices=3)
+    claims = {}
+    for i, device in enumerate(devices):
+        job_id = f"job-{i}"
+        submit(store, job_id, 1, now=T0)
+        claims[job_id] = store.claim_all(job_id, AGENT, [device], now=T0)
+        assert claims[job_id].ok
+        store.start_job(job_id, AGENT, claims[job_id].epoch, now=T0)
+
+    assert store.drain_agent(AGENT, now=T0 + 1) == "draining"
+
+    # ...and all three of its in-flight runs fail as it goes down.
+    for i, job_id in enumerate(claims):
+        store.complete_job(job_id, AGENT, claims[job_id].epoch, Outcome.INFRA_ERROR, now=T0 + 2 + i)
+
+    assert store.get_agent(AGENT).state == AgentState.DRAINING, (
+        "the drain was silently converted to a quarantine"
+    )
+    assert store.events(kind="agent.quarantined") == []
+
+
+def test_device_quarantine_survives_a_reboot(store):
+    """Step 7's bug, one level down. A device quarantined for repeated failures
+    is revived to `free` by the inventory upsert on the next re-register — and a
+    bench restart is, again, the first thing anyone tries."""
+    devices = bench(store, devices=2, version="0.1.0")
+    store.conn.execute(
+        """UPDATE resources SET state = 'unhealthy', quarantined_at = ?, consecutive_fails = 3
+            WHERE id = ?""",
+        (T0, devices[0]),
+    )
+
+    bench(store, devices=2, version="0.1.0", now=T0 + 100)  # same build, same fault
+
+    resource = store.get_resource(devices[0])
+    assert resource.state == ResourceState.UNHEALTHY, (
+        "a re-register must not revive a device TSS quarantined"
+    )
+    assert resource.quarantined_at == T0
+    assert store.get_resource(devices[1]).state == ResourceState.FREE
+
+
+def test_a_new_agent_version_clears_device_quarantine(store):
+    devices = bench(store, devices=2, version="0.1.0")
+    store.conn.execute(
+        "UPDATE resources SET state = 'unhealthy', quarantined_at = ? WHERE id = ?",
+        (T0, devices[0]),
+    )
+
+    bench(store, devices=2, version="0.2.0", now=T0 + 100)
+
+    resource = store.get_resource(devices[0])
+    assert resource.state == ResourceState.FREE
+    assert resource.quarantined_at is None
+
+
+def test_an_agent_cannot_clear_tss_s_own_quarantine_verdict(store):
+    """`resource_health` is the agent's opinion of its hardware. A device TSS
+    quarantined after three failures is TSS's verdict, and the bench reporting
+    itself healthy is not an appeal — `tss unquarantine` is."""
+    devices = bench(store, devices=2)
+    store.conn.execute(
+        "UPDATE resources SET state = 'unhealthy', quarantined_at = ? WHERE id = ?",
+        (T0, devices[0]),
+    )
+
+    store.report_resource_health(AGENT, {"vg-01": "healthy"}, now=T0 + 1)
+    assert store.get_resource(devices[0]).state == ResourceState.UNHEALTHY
+
+    # An operator can, and that is the difference.
+    assert store.unquarantine_resource(devices[0], now=T0 + 2) == "unquarantined"
+    assert store.get_resource(devices[0]).state == ResourceState.FREE
+
+
+def test_an_agent_reported_fault_is_still_the_agent_s_to_clear(store):
+    """The other half: a device the AGENT called unhealthy has no
+    `quarantined_at`, and the agent saying it recovered is exactly the signal
+    TSS has (§3.1 — TSS never probes hardware itself)."""
+    devices = bench(store, devices=2)
+    store.report_resource_health(AGENT, {"vg-01": "unhealthy"}, now=T0)
+    assert store.get_resource(devices[0]).state == ResourceState.UNHEALTHY
+    assert store.get_resource(devices[0]).quarantined_at is None
+
+    store.report_resource_health(AGENT, {"vg-01": "healthy"}, now=T0 + 1)
+    assert store.get_resource(devices[0]).state == ResourceState.FREE

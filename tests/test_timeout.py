@@ -146,6 +146,7 @@ def test_the_two_termination_paths_are_distinguishable(store, reaper, config):
     # A hung job on a live bench, timed out twice so it lands terminal.
     running_job(store, "job-hung", agent_id="bench-live", devices=1, started_at=T0)
     reaper.sweep_timeouts(now=T0 + BUDGET + 1)
+    store.renew_presence("bench-live", now=T0 + BUDGET + 2)  # it has been alive throughout
     claim = store.claim_all("job-hung", "bench-live", ["bench-live:vg-01"], now=T0 + BUDGET + 2)
     store.start_job("job-hung", "bench-live", claim.epoch, now=T0 + BUDGET + 2)
     reaper.sweep_timeouts(now=T0 + 2 * BUDGET + 3)
@@ -175,6 +176,7 @@ def test_the_checker_catches_a_record_that_names_the_wrong_path(store, reaper):
     killed a job the timeout sweep killed, and I6 must fail."""
     running_job(store, agent_id="bench-a", devices=1)
     reaper.sweep_timeouts(now=T0 + BUDGET + 1)
+    store.renew_presence("bench-a", now=T0 + BUDGET + 2)
     claim = store.claim_all("job-hang", "bench-a", ["bench-a:vg-01"], now=T0 + BUDGET + 2)
     store.start_job("job-hang", "bench-a", claim.epoch, now=T0 + BUDGET + 2)
     reaper.sweep_timeouts(now=T0 + 2 * BUDGET + 3)
@@ -205,3 +207,37 @@ def test_a_job_that_finishes_during_the_sweep_is_not_double_ended(store, reaper)
     assert job.state == JobState.PASSED
     assert job.outcome == Outcome.PASSED, "a real result is never overwritten by a sweep"
     assert check_all(store) == []
+
+
+# ---------------------------------------------- post-review hardening (§3.5)
+def test_the_timeout_sweep_pokes_the_scheduler(store, config):
+    """Sweep 2 frees devices exactly as sweep 1 does, so it owes the queue the
+    same wake-up. Without it those devices sit idle until the backstop tick —
+    correct, and dead for a second, which is the shape of every latency bug this
+    project has hit."""
+    poked = []
+    reaper = Reaper(store, config, on_reap=lambda: poked.append(1))
+    running_job(store, devices=1)
+
+    ended = reaper.sweep_timeouts(now=T0 + BUDGET + 1)
+
+    assert ended == ["job-hang"]
+    assert poked == [1], "devices came free and nobody was told"
+
+
+def test_the_timeout_sweep_revalidates_its_deadline_inside_the_transaction(store, config):
+    """The pre-read is advisory. Between selecting overdue jobs and acting on
+    one, its deadline can move — a restart, a longer budget, or simply another
+    writer getting there first. With one event loop this is unreachable; with the
+    second writer that Postgres brings (§9) it is not."""
+    claim = running_job(store, devices=1)
+    assert store.timed_out_jobs(now=T0 + BUDGET + 1) == [("job-hang", AGENT)]
+
+    # ...and now it is no longer overdue.
+    store.conn.execute("UPDATE jobs SET started_at = ? WHERE id = 'job-hang'", (T0 + BUDGET,))
+
+    assert store.time_out_job("job-hang", now=T0 + BUDGET + 1) is None
+    job = store.get_job("job-hang")
+    assert job.state == JobState.RUNNING, "a job inside its budget was killed anyway"
+    assert job.epoch == claim.epoch, "and its fence moved for nothing"
+    assert store.resources_held_by("job-hang") == [f"{AGENT}:vg-01"]

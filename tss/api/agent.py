@@ -18,12 +18,19 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from tss.api.deps import get_config, get_directives, get_scheduler, get_store
+from tss.api.deps import (
+    get_config,
+    get_directives,
+    get_scheduler,
+    get_silent_jobs,
+    get_store,
+)
 from tss.core.config import Config
 from tss.core.directives import DirectiveQueue
+from tss.core.fence import SilentJobTracker
 from tss.core.models import AgentState, Assignment, InventoryItem, Outcome, PresenceStatus
 from tss.core.scheduler import Scheduler
-from tss.core.store import Store
+from tss.core.store import DETAIL_UNREPORTED, Store
 
 log = logging.getLogger("tss.api.agent")
 
@@ -35,6 +42,7 @@ StoreDep = Annotated[Store, Depends(get_store)]
 ConfigDep = Annotated[Config, Depends(get_config)]
 SchedulerDep = Annotated[Scheduler, Depends(get_scheduler)]
 DirectivesDep = Annotated[DirectiveQueue, Depends(get_directives)]
+SilentJobsDep = Annotated[SilentJobTracker, Depends(get_silent_jobs)]
 
 
 class RegisterRequest(BaseModel):
@@ -92,7 +100,9 @@ class CompleteRequest(BaseModel):
 
 
 @router.post("/register", response_model=RegisterResponse)
-async def register(req: RegisterRequest, store: StoreDep, config: ConfigDep) -> RegisterResponse:
+async def register(
+    req: RegisterRequest, store: StoreDep, config: ConfigDep, silent_jobs: SilentJobsDep
+) -> RegisterResponse:
     """Register a bench and its inventory. Idempotent — re-registering replaces
     the inventory in place and never duplicates a device (§6)."""
     result = store.register_agent(
@@ -101,6 +111,7 @@ async def register(req: RegisterRequest, store: StoreDep, config: ConfigDep) -> 
         req.resources,
         agent_version=req.agent_version,
     )
+    silent_jobs.forget(req.agent_id)  # it has lost its hardware state; so do we
     log.info(
         "registered %s (%s) with %d device(s)%s",
         result.agent_id,
@@ -122,6 +133,7 @@ async def heartbeat(
     store: StoreDep,
     scheduler: SchedulerDep,
     directives: DirectivesDep,
+    silent_jobs: SilentJobsDep,
 ):
     """The workhorse: renew presence, report device health, collect work.
 
@@ -162,6 +174,20 @@ async def heartbeat(
             status_code=409,
             content={"error": "lease_lost", "action": "abandon_job", "job_id": lost},
         )
+
+    # THE INVERSE FENCE. The check above rejects what the bench reports and
+    # should not; this one catches what it does NOT report and should. A job the
+    # bench has stopped mentioning for two consecutive beats is one TSS thinks it
+    # is running and it does not — from a lost /start or a lost /complete — and
+    # nothing else would ever notice, because the bench is perfectly healthy.
+    for job_id in silent_jobs.observe(
+        agent_id,
+        owned=store.jobs_owned_by(agent_id),
+        reported=[j.job_id for j in req.running_jobs],
+    ):
+        if store.requeue_job(job_id, agent_id=agent_id, reason=DETAIL_UNREPORTED):
+            log.warning("%s never mentioned %s; taking it back", agent_id, job_id)
+            scheduler.notify()
 
     pending = directives.drain(agent_id)
     if agent is not None and agent.state == AgentState.DRAINING:

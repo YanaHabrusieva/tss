@@ -7,3 +7,7 @@ __pycache__/
 *.db-wal
 *.db-shm
 .DS_Store
+# `just add` writes each bench's inventory and output here.
+.demo-logs/
+# The README's run-it instructions create this in the working directory.
+bench.json

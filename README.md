@@ -40,8 +40,9 @@ runs, and use `.venv/bin/python -m ...` directly if you prefer.
 
 ## Run it
 
-Three terminals. **Terminal 1 — the service** (the dispatcher: API, scheduler and reaper, one
-process):
+Two terminals, or one if you use the demo shortcuts below.
+
+**Terminal 1 — the service** (the dispatcher: API, scheduler and reaper, one process):
 
 ```bash
 just serve                      # http://127.0.0.1:8000
@@ -65,7 +66,24 @@ JSON
 .venv/bin/python -m tss.agent.daemon --id bench-sf-02 --inventory bench.json
 ```
 
-**Terminal 3 — submit work and watch it.**
+### The short way
+
+Three recipes exist so a demo needs one terminal instead of four:
+
+```bash
+just start                      # opens http://127.0.0.1:8000/ and serves in the FOREGROUND
+just add bench-sf-01 2 0        # a bench with 2 vehicle gateways, in the background
+just add bench-ag-01 1 2        # 1 vehicle gateway + 2 asset gateways
+just kill bench-sf-01           # stop that bench — watch it go OFFLINE
+```
+
+`just add NAME VG AG` writes the inventory for you and backgrounds the daemon, with its output in
+`.demo-logs/NAME.log` so the terminal stays readable. `just start` runs the service in the
+foreground, so **Ctrl-C still stops it**, and sets `TSS_STARVATION_THRESHOLD_S=5` — the demo
+setting. Production is 60s; five seconds is simply short enough to stand in front of while a
+multi-device job waits to reserve.
+
+**Then submit work and watch it.**
 
 ```bash
 just submit smoke                     # one device
@@ -126,7 +144,7 @@ just watch                     # leave this running
 In another terminal, kill a bench that is running something:
 
 ```bash
-pkill -f "tss.agent.daemon --id bench-sf-01"
+pkill -f "tss.agent.daemon --id bench-sf-01"    # or: just kill bench-sf-01
 ```
 
 The bench flips to **OFFLINE** on both `tss watch` and the web page, and its jobs re-queue **within

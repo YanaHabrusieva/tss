@@ -43,6 +43,24 @@ serve PORT="8000":
 agent ID="bench-sf-01" DEVICES="3":
     {{py}} -m tss.agent.daemon --id {{ID}} --devices {{DEVICES}}
 
+# The demo: open the web view, then run the service in the FOREGROUND (Ctrl-C stops it).
+start PORT="8000":
+    @(sleep 1; open http://127.0.0.1:{{PORT}}/ || xdg-open http://127.0.0.1:{{PORT}}/ || true) >/dev/null 2>&1 &
+    @# 5s is the DEMO starvation threshold, not production: 60s is right on a real
+    @# fleet and far too long to stand in front of while a big job waits to reserve.
+    TSS_STARVATION_THRESHOLD_S=5 {{py}} -m uvicorn tss.api.app:app --host 127.0.0.1 --port {{PORT}}
+
+# Add a bench in the BACKGROUND: `just add bench-sf-01 2 1` -> vg-01 vg-02 ag-01.
+add NAME VG="2" AG="0":
+    @mkdir -p .demo-logs
+    @{{py}} -c "import json,sys; vg=int(sys.argv[1]); ag=int(sys.argv[2]); sys.exit('just add: {{NAME}} needs at least one device — try: just add {{NAME}} 2 0') if vg+ag < 1 else None; items=[{'id':f'vg-{i:02d}','capabilities':{'product':'vehicle_gateway'}} for i in range(1,vg+1)]+[{'id':f'ag-{i:02d}','capabilities':{'product':'asset_gateway'}} for i in range(1,ag+1)]; open(sys.argv[3],'w').write(json.dumps(items,indent=1))" {{VG}} {{AG}} .demo-logs/{{NAME}}.inventory.json
+    @nohup {{py}} -m tss.agent.daemon --id {{NAME}} --inventory .demo-logs/{{NAME}}.inventory.json >> .demo-logs/{{NAME}}.log 2>&1 &
+    @echo "{{NAME}}: {{VG}} vehicle_gateway + {{AG}} asset_gateway — log: .demo-logs/{{NAME}}.log"
+
+# Stop a bench started with `just add` — the same pattern the README kills by.
+kill NAME:
+    @pkill -f "tss.agent.daemon --id {{NAME}}" && echo "{{NAME}} killed — it goes OFFLINE in about 14s." || echo "no bench called {{NAME}} is running."
+
 # Benches and their devices.
 fleet:
     @{{py}} -m tss.cli.main fleet

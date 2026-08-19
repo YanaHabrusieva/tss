@@ -604,3 +604,63 @@ def test_one_missed_beat_is_not_enough(dispatch_server, db_path):
     job = asyncio.run(scenario())
 
     assert job["state"] in ("assigned", "running")
+
+
+def test_a_job_the_bench_was_never_told_about_is_not_taken_back(dispatch_server, db_path):
+    """THE FENCE MUST ONLY ACCUSE A BENCH OF SILENCE ABOUT WORK IT WAS TOLD IT OWNS.
+
+    `pending_assignment` hands over ONE job per heartbeat; the tracker counted a
+    miss against EVERY job the bench owned. So a bench given two jobs in one
+    scheduler pass — ordinary, it has two free devices — went:
+
+        beat 1   owns {A, B}, reports {}       -> miss 1 for both; A delivered
+        beat 2   owns {A, B}, reports {A}      -> B's second miss: REQUEUED
+
+    ...and B was taken back, epoch bumped, before TSS had ever mentioned it. The
+    daemon re-polls immediately after taking an assignment rather than waiting a
+    beat, which makes those two heartbeats milliseconds apart — so this is the
+    common case on any bench with spare capacity, not a rare race.
+    """
+    base, _config = dispatch_server
+    store = Store(db_path)
+
+    async def scenario():
+        async with httpx.AsyncClient(base_url=base, timeout=20.0) as client:
+            await _register(client, AGENT, devices=2)
+            for name in ("first", "second"):
+                await client.post(
+                    "/v1/jobs",
+                    json={"name": name, "requirements": [{"product": "vehicle_gateway"}]},
+                )
+            # Both land on this bench in one scheduler pass: two free devices.
+            deadline = time.monotonic() + 10
+            while True:
+                assert time.monotonic() < deadline, "the fleet never took both jobs"
+                owned = store.jobs_owned_by(AGENT)
+                if len(owned) == 2:
+                    break
+                await asyncio.sleep(0.02)
+            before = {j: store.get_job(j).epoch for j in owned}
+
+            # Beat one: it has been told about nothing yet.
+            first = (await _beat(client, AGENT)).json().get("assignment")
+            assert first is not None, "TSS delivered no assignment at all"
+            # Beat two: it reports the one job it was actually handed.
+            await _beat(client, AGENT, running=[(first["job_id"], first["epoch"])])
+            return owned, before, first["job_id"]
+
+    owned, before, delivered = asyncio.run(scenario())
+
+    undelivered = [j for j in owned if j != delivered]
+    for job_id in undelivered:
+        job = store.get_job(job_id)
+        assert job.epoch == before[job_id], (
+            f"{job_id} was taken back from a bench TSS had never told about it "
+            f"(epoch {before[job_id]} -> {job.epoch})"
+        )
+    assert not [
+        e
+        for e in store.events()
+        if e.kind == "job.requeued" and (e.detail or {}).get("reason") == "unreported_by_agent"
+    ], "the inverse fence fired on a job that was never delivered"
+    store.close()

@@ -7,6 +7,8 @@ later should be a config change rather than a refactor.
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 import time
 import uuid
 from typing import Annotated, Any
@@ -31,6 +33,8 @@ from tss.core.models import (
 from tss.core.scheduler import Scheduler
 from tss.core.store import Store
 
+log = logging.getLogger("tss.api.client")
+
 router = APIRouter(prefix="/v1", tags=["client"])
 
 StoreDep = Annotated[Store, Depends(get_store)]
@@ -51,6 +55,11 @@ class SubmitRequest(BaseModel):
     #: bench" be expressible later without reshaping the schema.
     requirements: list[CapabilitySpec]
     payload: dict[str, Any] = Field(default_factory=dict)
+    #: LOWER RUNS FIRST — 0 is the front of the queue, 1000 the back, 100 the
+    #: default. It reads backwards said aloud ("higher priority" is a smaller
+    #: number), so it is written down here, in the model the caller fills in,
+    #: rather than left to be inferred from an ORDER BY three files away.
+    #: Ties break on submission time, so equal-priority work is still FIFO.
     priority: int = Field(default=100, ge=0, le=1000)
     #: `0` would start, be killed by the next timeout sweep, and be recorded as
     #: `infra_error` — the fleet blamed for the caller's input, which is the one
@@ -165,18 +174,46 @@ async def submit_job(
             ),
         )
 
-    job_id = f"job-{uuid.uuid4().hex[:8]}"
-    store.submit_job(
-        job_id,
-        req.name,
-        req.requirements,
-        payload=req.payload,
-        priority=req.priority,
-        max_duration_s=req.max_duration_s,
-    )
+    job_id = _submit_with_a_unique_id(store, req)
     # Wake the scheduler now rather than waiting for the backstop tick.
     scheduler.notify()
     return SubmitResponse(job_id=job_id, queue_position=store.queue_position(job_id))
+
+
+#: Hex characters of randomness in a job id. Eight — 32 bits — gives even odds
+#: of a collision at about 77,000 jobs, which a busy fleet reaches in weeks, and
+#: a collision surfaced as an unhandled IntegrityError: a 500 for a request that
+#: was perfectly valid. Sixteen puts the same coin-flip past 5 billion. The human
+#: short id is still the first five characters, so nothing on screen changes.
+JOB_ID_HEX = 16
+
+
+def _submit_with_a_unique_id(store: Store, req: SubmitRequest) -> str:
+    """Insert the job, retrying once if the id collides.
+
+    Belt and braces: the width above makes a collision vanishingly unlikely and
+    this makes it a non-event if it happens anyway. Once, not forever — a second
+    collision is not bad luck, it is a broken random source, and a retry loop
+    would hide that behind a hang.
+    """
+    for attempt in range(2):
+        job_id = f"job-{uuid.uuid4().hex[:JOB_ID_HEX]}"
+        try:
+            store.submit_job(
+                job_id,
+                req.name,
+                req.requirements,
+                payload=req.payload,
+                priority=req.priority,
+                max_duration_s=req.max_duration_s,
+            )
+        except sqlite3.IntegrityError:
+            log.warning("job id %s collided; retrying once", job_id)
+            if attempt:
+                raise
+            continue
+        return job_id
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatus)

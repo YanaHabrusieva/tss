@@ -237,8 +237,19 @@ async def heartbeat(
         # re-sent every beat, so it survives a lost response and a TSS restart
         # without a delivery protocol.
         pending = [*pending, "drain"]
+
+    def handed_over(assignment: Assignment | None) -> Assignment | None:
+        """Every assignment leaves through here, so the fence knows what this
+        bench has been told. Silence about a job TSS never mentioned is TSS's
+        silence, not the bench's."""
+        if assignment is not None:
+            silent_jobs.delivered(agent_id, assignment.job_id)
+        return assignment
+
     if pending:
-        return HeartbeatResponse(assignment=store.pending_assignment(agent_id), directives=pending)
+        return HeartbeatResponse(
+            assignment=handed_over(store.pending_assignment(agent_id)), directives=pending
+        )
 
     assignment = store.pending_assignment(agent_id)
     if (
@@ -256,7 +267,7 @@ async def heartbeat(
     trailing = directives.drain(agent_id)
     if agent is not None and agent.state == AgentState.DRAINING:
         trailing = [*trailing, "drain"]
-    return HeartbeatResponse(assignment=assignment, directives=trailing)
+    return HeartbeatResponse(assignment=handed_over(assignment), directives=trailing)
 
 
 @job_router.post("/{job_id}/start")

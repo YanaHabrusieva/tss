@@ -104,9 +104,24 @@ class TestbedAgent:
         body = _parse(response)
         if body is None:
             return
-        self.heartbeat_interval_s = body["heartbeat_interval_s"]
-        self.presence_ttl_s = body["presence_ttl_s"]
-        self.longpoll_timeout_s = body.get("longpoll_timeout_s", 8.0)
+        # EVERY field defaulted, not just the third. A 200 whose body is valid
+        # JSON but missing a key is the same proxy-mangled-response class that
+        # `_parse` exists to survive — and reading it with [] turned that into a
+        # KeyError that killed the loop, so the bench never registered, never
+        # heartbeated, and went offline without ever saying why. Beating at the
+        # default interval against a service that wanted a different one is a
+        # tuning problem; not beating at all is an outage.
+        for field, attribute in (
+            ("heartbeat_interval_s", "heartbeat_interval_s"),
+            ("presence_ttl_s", "presence_ttl_s"),
+            ("longpoll_timeout_s", "longpoll_timeout_s"),
+        ):
+            if field not in body:
+                log.warning(
+                    "register response has no %s; keeping %ss", field, getattr(self, attribute)
+                )
+                continue
+            setattr(self, attribute, body[field])
         self.registered = True
         log.info(
             "registered %s with %d device(s): %s",

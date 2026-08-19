@@ -120,6 +120,9 @@ class Resource(BaseModel):
     last_assigned_at: float | None = None
     consecutive_fails: int = 0
     quarantined_at: float | None = None
+    #: The bench reported this device faulty while it was busy; the fault lands
+    #: when the device is released (§4.2).
+    fault_reported_at: float | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Resource:
@@ -150,6 +153,9 @@ class Job(BaseModel):
     started_at: float | None = None
     finished_at: float | None = None
     blocked_reason: str | None = None
+    #: When this job became unsatisfiable — NOT when it was submitted. The
+    #: dead-letter window runs from here and resets if the fleet recovers.
+    blocked_since: float | None = None
     outcome: Outcome | None = None
     result_detail: str | None = None
 

@@ -248,10 +248,23 @@ class Scheduler:
         ]
 
     def _mark_unsatisfiable(self, job: Job, now: float) -> None:
-        """Flag it, say so once, and KEEP IT QUEUED — fleets get repaired."""
+        """Flag it, say so once, and KEEP IT QUEUED — fleets get repaired.
+
+        THE CLOCK STARTS AT FLAGGING, NOT AT SUBMISSION. Measured from
+        `submitted_at`, a job that sat happily on a healthy fleet for longer than
+        UNSATISFIABLE_TIMEOUT was dead-lettered the instant the last capable
+        bench retired — punished on the way in for time during which nothing was
+        wrong. The window is meant to be "nobody could run this for half an
+        hour", so it runs from the moment nobody could, and `_clear_unsatisfiable`
+        resets it when the fleet recovers.
+        """
         if self.store.set_blocked_reason(job.id, BLOCKED_NO_CAPABLE_AGENT, now=now):
             log.warning("%s cannot run on this fleet as it stands: no capable bench", job.id)
-        expired = now - job.submitted_at > self.config.unsatisfiable_timeout_s
+            return  # the clock starts now; it cannot already have run out
+        # `job` was read before the flag was written, so on every later pass this
+        # is the stamp from the pass that first flagged it.
+        blocked_since = job.blocked_since if job.blocked_since is not None else now
+        expired = now - blocked_since > self.config.unsatisfiable_timeout_s
         if expired and self.store.dead_letter_unsatisfiable(job.id, now=now):
             log.warning("%s dead-lettered: no capable bench appeared", job.id)
 

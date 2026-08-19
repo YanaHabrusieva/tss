@@ -83,6 +83,10 @@ _BUSY_ERRCODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
 #:   3  indexes on events(job_id) and events(kind, agent_id, seq) — the table is
 #:      append-only and unbounded, so the fleet view, the timeout sweep and I6
 #:      were scanning more of it every hour the service stayed up
+#:   4  resources.fault_reported_at — a bench's fault report against a device it
+#:      is still using, applied when the device is released rather than dropped;
+#:      jobs.blocked_since — the dead-letter clock runs from when a job became
+#:      unsatisfiable, not from when it was submitted
 #:
 #: This is NOT a migration system and is not trying to be one; migrations are out
 #: of scope for the POC. It exists because the failure it prevents is silent:
@@ -90,7 +94,7 @@ _BUSY_ERRCODES = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
 #: they were, so a stale file goes on cheerfully accepting writes this build
 #: forbids, and the first sign of trouble is a report that quietly disagrees with
 #: the code. Refusing to open is loud, immediate, and one `rm` from fixed.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class SchemaVersionError(RuntimeError):
@@ -121,7 +125,11 @@ CREATE TABLE IF NOT EXISTS resources (
     current_job_id    TEXT REFERENCES jobs(id),  -- single column => I2 is structural
     last_assigned_at  REAL,                    -- drives LRU (§3.4)
     consecutive_fails INTEGER NOT NULL DEFAULT 0,
-    quarantined_at    REAL
+    quarantined_at    REAL,
+    -- The bench reported this device faulty while it was BUSY. Its state cannot
+    -- change until the job ends, so the report is remembered here and applied on
+    -- release (§4.2). Withdrawn by a later `healthy` report; cleared when applied.
+    fault_reported_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_res_dispatch ON resources(agent_id, state, last_assigned_at);
 CREATE INDEX IF NOT EXISTS idx_res_job
@@ -147,6 +155,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     started_at     REAL,
     finished_at    REAL,
     blocked_reason TEXT,                       -- 'no_capable_agent' — surfaced by `tss why`
+    -- When this job BECAME unsatisfiable, not when it was submitted. The
+    -- dead-letter window runs from here, so time spent queued on a fleet that
+    -- could have run it does not count against it (§3.4.1).
+    blocked_since  REAL,
     outcome        TEXT CHECK (outcome IS NULL OR outcome IN
                      ('passed','failed','infra_error','cancelled')),
                                                -- no 'dead_letter': that is a STATE.
@@ -200,7 +212,9 @@ UPDATE jobs
        attempt      = attempt + 1,
        tried_agents = json_insert(tried_agents, '$[#]', :agent_id),
        assigned_at  = :now,
-       blocked_reason = NULL   -- it just ran; whatever blocked it no longer does
+       -- it just ran; whatever blocked it no longer does
+       blocked_reason = NULL,
+       blocked_since  = NULL
  WHERE id = :job_id
    AND state = 'queued'
    AND resource_count = :n
@@ -703,12 +717,24 @@ class Store:
         """Apply the agent's own device probes (§3.1, §4.2).
 
         Device health and machine health are different things: one dead J-Link
-        costs you one device, not the bench. A `busy` device is left alone — its
-        job has to end before the device can change state, and that path arrives
-        with completion in step 3. A `retired` device is left alone too: the
-        transitions below are guarded to free<->unhealthy, so a stale health
-        report cannot bring a device that is no longer on the bench back into the
-        pool.
+        costs you one device, not the bench.
+
+        A BUSY DEVICE'S FAULT IS REMEMBERED, NOT DROPPED. Its state cannot change
+        while it holds a job — I2 and I8 both run through `state='busy'` — so the
+        report is recorded on the row and applied the moment the device is
+        released, by completion, requeue, cancel or reap. This docstring used to
+        promise that completion handled it; completion freed the device straight
+        back into the pool and the fault evaporated, so a bench that noticed a
+        dead J-Link mid-job was ignored and handed the same device again.
+
+        A later `healthy` report withdraws a remembered fault, whether or not the
+        device is still busy: the bench is the authority on its own hardware and
+        may change its mind before the job ends.
+
+        A `retired` device is left alone: the transitions below are guarded, so a
+        stale health report cannot bring a device that is no longer on the bench
+        back into the pool. TSS's own quarantine is not the agent's to withdraw
+        either — that is what `quarantined_at` guards.
         """
         now = time.time() if now is None else now
         changed: list[str] = []
@@ -719,7 +745,29 @@ class Store:
                     "UPDATE resources SET state = 'unhealthy' WHERE id = ? AND state = 'free'",
                     "resource.unhealthy",
                 )
+                # Busy: it cannot move now, so remember it for the release. Only
+                # `busy` — a retired device stays gone, and a device already
+                # unhealthy has nothing to defer.
+                deferred = self.conn.execute(
+                    """UPDATE resources SET fault_reported_at = ?
+                        WHERE id = ? AND state = 'busy' AND fault_reported_at IS NULL""",
+                    (now, resource_id),
+                )
+                if deferred.rowcount == 1:
+                    self.append_event(
+                        "resource.fault_reported",
+                        agent_id=agent_id,
+                        resource_id=resource_id,
+                        detail={"applies": "on release"},
+                        now=now,
+                    )
+                    changed.append(resource_id)
+                    continue
             elif status in (ResourceState.FREE, "healthy"):
+                # Withdraw a remembered fault too, busy or not.
+                self.conn.execute(
+                    "UPDATE resources SET fault_reported_at = NULL WHERE id = ?", (resource_id,)
+                )
                 # Only a fault the AGENT reported is the agent's to withdraw. A
                 # device TSS quarantined after repeated failures carries
                 # `quarantined_at`, and a bench announcing itself healthy is not
@@ -865,11 +913,7 @@ class Store:
                 )
             ]
             # Every device this job holds, in one statement. Not a loop.
-            conn.execute(
-                """UPDATE resources SET state = 'free', current_job_id = NULL
-                    WHERE current_job_id = :job_id AND state = 'busy'""",
-                {"job_id": job_id},
-            )
+            self._release_resources(conn, "current_job_id = :job_id", {"job_id": job_id}, now=now)
             # Blame AFTER the release: quarantining a device means moving it out
             # of `free`, and doing that first would only have it freed back.
             self._attribute_failure(conn, agent_id, held, outcome=outcome, now=now)
@@ -878,6 +922,48 @@ class Store:
             self._rollback(conn)
             raise
         return accepted
+
+    def _release_resources(
+        self, conn: sqlite3.Connection, where: str, params, *, now: float
+    ) -> None:
+        """Free every BUSY device matching `where` — honouring a remembered fault.
+
+        Every release path funnels through here (completion, requeue, timeout,
+        cancel, reap, drain) so that a fault the bench reported mid-job lands
+        exactly once, wherever the job happened to end. A device with a pending
+        report comes back `unhealthy` instead of `free`; everything else comes
+        back free, as before.
+
+        `quarantined_at` is untouched: TSS's own verdict and the bench's report
+        are different claims about the same device, and only an operator clears
+        the first (§4.2).
+        """
+        faulted = [
+            (r["id"], r["agent_id"])
+            for r in conn.execute(
+                f"SELECT id, agent_id FROM resources "  # noqa: S608 - `where` is a literal
+                f"WHERE ({where}) AND state = 'busy' AND fault_reported_at IS NOT NULL",
+                params,
+            )
+        ]
+        conn.execute(
+            f"""UPDATE resources
+                   SET state = CASE WHEN fault_reported_at IS NOT NULL
+                                    THEN 'unhealthy' ELSE 'free' END,
+                       current_job_id = NULL,
+                       fault_reported_at = NULL
+                 WHERE ({where}) AND state = 'busy'""",  # noqa: S608 - `where` is a literal
+            params,
+        )
+        for resource_id, agent_id in faulted:
+            self._insert_event(
+                conn,
+                kind="resource.unhealthy",
+                ts=now,
+                agent_id=agent_id,
+                resource_id=resource_id,
+                detail={"reported_while_busy": True},
+            )
 
     def _attribute_failure(
         self,
@@ -1077,11 +1163,7 @@ class Store:
             # device free because its machine died would be TSS deciding the
             # J-Link got fixed, and no exception for `retired` is needed once the
             # update only touches what was claimed.
-            conn.execute(
-                """UPDATE resources SET state = 'free', current_job_id = NULL
-                    WHERE agent_id = ? AND state = 'busy'""",
-                (agent_id,),
-            )
+            self._release_resources(conn, "agent_id = :agent_id", {"agent_id": agent_id}, now=now)
             self._insert_event(
                 conn,
                 kind="agent.offline",
@@ -1182,11 +1264,7 @@ class Store:
                 return None
             # THIS job's devices only — the bench is fine and its other jobs are
             # still running on it (§7.2).
-            conn.execute(
-                """UPDATE resources SET state = 'free', current_job_id = NULL
-                    WHERE current_job_id = :job_id AND state = 'busy'""",
-                {"job_id": job_id},
-            )
+            self._release_resources(conn, "current_job_id = :job_id", {"job_id": job_id}, now=now)
             self._commit(conn)
         except BaseException:
             self._rollback(conn)
@@ -1219,11 +1297,7 @@ class Store:
             if kind is None:
                 self._rollback(conn)
                 return None
-            conn.execute(
-                """UPDATE resources SET state = 'free', current_job_id = NULL
-                    WHERE current_job_id = :job_id AND state = 'busy'""",
-                {"job_id": job_id},
-            )
+            self._release_resources(conn, "current_job_id = :job_id", {"job_id": job_id}, now=now)
             self._commit(conn)
         except BaseException:
             self._rollback(conn)
@@ -1274,10 +1348,8 @@ class Store:
                     requeued.append(job_id)
             if requeued:
                 placeholders = ",".join("?" * len(requeued))
-                conn.execute(
-                    f"""UPDATE resources SET state = 'free', current_job_id = NULL
-                         WHERE current_job_id IN ({placeholders}) AND state = 'busy'""",
-                    tuple(requeued),
+                self._release_resources(
+                    conn, f"current_job_id IN ({placeholders})", tuple(requeued), now=now
                 )
 
             finishing = self._distinct_jobs_on(conn, agent_id)
@@ -1358,13 +1430,20 @@ class Store:
         The job stays QUEUED. Fleets change — a bench gets repaired,
         un-quarantined or added — and a job that cannot run on today's fleet may
         run on tomorrow's (§3.4.1).
+
+        `blocked_since` is stamped with the same write, because the dead-letter
+        window runs from the moment a job BECAME unsatisfiable, not from when it
+        was submitted. Clearing the reason clears the clock, so a fleet that
+        recovers and then breaks again gives the job the full window over.
         """
         now = time.time() if now is None else now
         cur = self.conn.execute(
-            """UPDATE jobs SET blocked_reason = :reason
+            """UPDATE jobs
+                  SET blocked_reason = :reason,
+                      blocked_since = CASE WHEN :reason IS NULL THEN NULL ELSE :now END
                 WHERE id = :job_id AND state = 'queued'
                   AND (blocked_reason IS NOT :reason)""",
-            {"reason": reason, "job_id": job_id},
+            {"reason": reason, "job_id": job_id, "now": now},
         )
         if cur.rowcount != 1:
             return False
@@ -1455,11 +1534,7 @@ class Store:
                     WHERE job_id = :job_id AND released_at IS NULL""",
                 {"now": now, "job_id": job_id},
             )
-            conn.execute(
-                """UPDATE resources SET state = 'free', current_job_id = NULL
-                    WHERE current_job_id = :job_id AND state = 'busy'""",
-                {"job_id": job_id},
-            )
+            self._release_resources(conn, "current_job_id = :job_id", {"job_id": job_id}, now=now)
             self._insert_event(
                 conn,
                 kind="job.cancelled",
@@ -1478,17 +1553,42 @@ class Store:
     def fence_running_jobs(self, agent_id: str, reported: Sequence[tuple[str, int]]) -> str | None:
         """Check what the agent believes it owns against the epoch (§6).
 
-        Returns the first job it has lost, or None. Each job is checked
-        INDEPENDENTLY: a bench running two jobs can lose one — cancelled, timed
-        out, or reassigned after a blip — and must keep the other. Returning the
-        job id is what lets the agent abandon exactly that run.
+        Returns the first job it has lost, in the order the agent reported them,
+        or None. Each job is checked INDEPENDENTLY: a bench running two jobs can
+        lose one — cancelled, timed out, or reassigned after a blip — and must
+        keep the other. Returning the job id is what lets the agent abandon
+        exactly that run.
+
+        ONE QUERY, NOT ONE PER JOB. This runs on every heartbeat of every bench
+        in the fleet, which makes it the hottest read path there is, and it was
+        the only N+1 on it: fifteen benches running three jobs each at a 3s beat
+        is 45 point lookups a beat that one `IN` covers. The per-job verdicts are
+        unchanged — an unknown job, a stale epoch, a different owner and a
+        terminal state all still mean "you do not own this any more", and the
+        FIRST one in the reported order is still what comes back, because the
+        agent abandons exactly the job it is told about.
         """
+        if not reported:
+            return None
+        placeholders = ",".join("?" * len(reported))
+        rows = {
+            row["id"]: row
+            for row in self.conn.execute(
+                f"SELECT id, agent_id, epoch, state FROM jobs "  # noqa: S608 - placeholders only
+                f"WHERE id IN ({placeholders})",
+                tuple(job_id for job_id, _ in reported),
+            )
+        }
         for job_id, epoch in reported:
-            job = self.get_job(job_id)
-            if job is None:
-                return job_id
-            if job.agent_id != agent_id or job.epoch != epoch or job.is_terminal:
-                return job_id
+            row = rows.get(job_id)
+            if row is None:
+                return job_id  # unknown_job
+            if (
+                row["agent_id"] != agent_id
+                or int(row["epoch"]) != epoch
+                or row["state"] in TERMINAL_JOB_STATES
+            ):
+                return job_id  # stale_epoch, wrong owner, or already_terminal
         return None
 
     @staticmethod

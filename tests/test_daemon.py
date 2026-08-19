@@ -215,3 +215,52 @@ def test_a_non_json_registration_response_is_survivable():
         return registered
 
     assert asyncio.run(scenario()), "it never got past a bad registration response"
+
+
+# ------------------------------------------------- a well-formed lie from TSS
+@pytest.mark.parametrize(
+    "missing", ["heartbeat_interval_s", "presence_ttl_s", "longpoll_timeout_s"]
+)
+def test_a_register_response_missing_a_field_does_not_kill_the_daemon(missing):
+    """The same proxy-mangled-response class `_parse` exists to survive, one
+    layer in: valid JSON, 200, but a key short.
+
+    Read with `body["heartbeat_interval_s"]`, that was a KeyError — not an
+    `httpx.HTTPError`, so it sailed past every handler in `run()` and killed the
+    loop. The bench then never registered, never heartbeated and went offline
+    without ever saying why. Beating at the default interval against a service
+    that wanted another one is a tuning problem; not beating at all is an outage.
+    """
+    body = {"heartbeat_interval_s": 5.0, "presence_ttl_s": 20.0, "longpoll_timeout_s": 9.0}
+    body.pop(missing)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    bench = agent(handler)
+    defaults = {
+        "heartbeat_interval_s": bench.heartbeat_interval_s,
+        "presence_ttl_s": bench.presence_ttl_s,
+        "longpoll_timeout_s": bench.longpoll_timeout_s,
+    }
+
+    asyncio.run(bench.register(bench._client))
+
+    assert bench.registered, "the bench gave up over one absent field"
+    assert getattr(bench, missing) == defaults[missing], "it must fall back, not guess"
+    for field, value in body.items():
+        assert getattr(bench, field) == value, "the fields that WERE sent must still be honoured"
+
+
+def test_a_register_response_that_is_not_json_at_all_is_survived():
+    """`_parse`'s own case, asserted rather than assumed: the bench stays
+    unregistered and tries again, instead of dying."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>502 from a proxy</html>")
+
+    bench = agent(handler)
+
+    asyncio.run(bench.register(bench._client))
+
+    assert not bench.registered, "it must retry, not carry on as if registered"

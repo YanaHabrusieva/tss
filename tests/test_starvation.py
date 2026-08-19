@@ -293,15 +293,15 @@ def test_an_impossible_job_at_the_head_does_not_suppress_reservation_behind_it(
 def test_the_impossible_job_dead_letters_on_its_own_clock_while_the_other_still_reserves(
     store, scheduler, config
 ):
-    """Its 30-minute clock runs from ITS submission, independently of whatever is
-    reserving. The two jobs do not share a fate."""
+    """Its 30-minute clock runs from ITS OWN flagging, independently of whatever
+    is reserving. The two jobs do not share a fate."""
     devices = bench(store, "bench-01", devices=2)
     occupy(store, "bench-01", devices[:1])
     submit(store, "job-impossible", 2, now=T0, caps=AG)
     submit(store, "job-big", 2, now=T0 + 1, caps=VG)
     tick(scheduler, store, T0 + STARVED)
 
-    tick(scheduler, store, T0 + config.unsatisfiable_timeout_s + 1)
+    tick(scheduler, store, T0 + STARVED + config.unsatisfiable_timeout_s + 1)
 
     impossible = store.get_job("job-impossible")
     assert impossible.state == JobState.DEAD_LETTER
@@ -331,13 +331,17 @@ def test_an_unsatisfiable_job_runs_once_the_fleet_is_repaired(store, scheduler, 
 
 
 def test_an_unsatisfiable_job_dead_letters_after_the_timeout(store, scheduler, config):
+    """The window runs from FLAGGING, so it is `STARVED + timeout` here, not
+    `timeout` — see the two tests below for why that distinction matters."""
     bench(store, "bench-01", devices=1)
     submit(store, "job-impossible", 3, now=T0, caps=VG)
 
     tick(scheduler, store, T0 + STARVED)
     assert store.get_job("job-impossible").state == JobState.QUEUED
+    flagged_at = store.get_job("job-impossible").blocked_since
+    assert flagged_at == T0 + STARVED, "the clock must start when it was flagged"
 
-    tick(scheduler, store, T0 + config.unsatisfiable_timeout_s + 1)
+    tick(scheduler, store, flagged_at + config.unsatisfiable_timeout_s + 1)
 
     job = store.get_job("job-impossible")
     assert job.state == JobState.DEAD_LETTER
@@ -579,3 +583,75 @@ def test_the_queue_view_says_which_devices_a_reservation_is_withholding(store, s
     # ...and it is still free and still nobody's, which is the whole point.
     assert store.get_resource(reserved_bench[1]).state == ResourceState.FREE
     assert store.get_resource(reserved_bench[1]).current_job_id is None
+
+
+# ------------------------------------------------- when the clock starts
+def test_time_on_a_fleet_that_could_have_run_it_does_not_count(store, scheduler, config):
+    """The bug this fixes: the window was measured from `submitted_at`, so a job
+    that queued happily for longer than UNSATISFIABLE_TIMEOUT on a healthy fleet
+    was dead-lettered THE INSTANT the last capable bench went away — punished on
+    the way in for time during which nothing was wrong with it.
+
+    Here the fleet can run the job for well past the whole window; only then does
+    the hardware disappear. The job must get its full window from that moment.
+    """
+    devices = bench(store, "bench-01", devices=1)
+    long_wait = config.unsatisfiable_timeout_s * 2
+    occupy(store, "bench-01", devices)  # busy, so the job waits rather than running
+    submit(store, "job-late", 1, now=T0, caps=VG)
+
+    # A long, blameless wait on a fleet that has the hardware.
+    tick(scheduler, store, T0 + long_wait)
+    job = store.get_job("job-late")
+    assert job.state == JobState.QUEUED
+    assert job.blocked_reason is None, "nothing was wrong with the fleet"
+    assert job.blocked_since is None
+
+    # Now the only capable bench retires.
+    store.register_agent("bench-01", "bench-01.local", [], now=T0 + long_wait)
+    tick(scheduler, store, T0 + long_wait + 1)
+
+    job = store.get_job("job-late")
+    assert job.blocked_reason == BLOCKED_NO_CAPABLE_AGENT
+    assert job.state == JobState.QUEUED, (
+        "dead-lettered the moment the fleet broke, for time it spent on a fleet that was fine"
+    )
+    # ...and it still gets the whole window before anyone gives up on it.
+    tick(scheduler, store, T0 + long_wait + config.unsatisfiable_timeout_s)
+    assert store.get_job("job-late").state == JobState.QUEUED
+    tick(scheduler, store, T0 + long_wait + config.unsatisfiable_timeout_s + 2)
+    assert store.get_job("job-late").state == JobState.DEAD_LETTER
+
+
+def test_a_fleet_that_recovers_gives_the_job_its_window_back(store, scheduler, config):
+    """The clock is not cumulative. Half a window of no capable bench, then a
+    repair, does not leave the job half-condemned — the next outage starts over,
+    because "nobody could run this for half an hour" is a statement about one
+    continuous stretch."""
+    bench(store, "bench-01", devices=1, caps=AG)
+    submit(store, "job-vg", 1, now=T0, caps=VG)
+
+    tick(scheduler, store, T0 + STARVED)
+    first_flag = store.get_job("job-vg").blocked_since
+    assert first_flag is not None
+
+    # Most of the way through the window, then the right hardware appears.
+    tick(scheduler, store, first_flag + config.unsatisfiable_timeout_s * 0.9)
+    assert store.get_job("job-vg").state == JobState.QUEUED
+    devices = bench(store, "bench-02", devices=1, caps=VG)
+    occupy(store, "bench-02", devices)  # capable, but busy: still nothing to claim
+    repaired_at = first_flag + config.unsatisfiable_timeout_s * 0.95
+    tick(scheduler, store, repaired_at)
+
+    job = store.get_job("job-vg")
+    assert job.blocked_reason is None, "a capable bench exists again"
+    assert job.blocked_since is None, "the clock must reset, not merely pause"
+
+    # It breaks again. The job gets the full window from HERE, not the sliver
+    # that was left of the first one.
+    store.register_agent("bench-02", "bench-02.local", [], now=repaired_at + 1)
+    tick(scheduler, store, repaired_at + 2)
+    tick(scheduler, store, repaired_at + config.unsatisfiable_timeout_s)
+    assert store.get_job("job-vg").state == JobState.QUEUED, (
+        "the earlier outage was counted against it"
+    )

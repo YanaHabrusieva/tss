@@ -508,7 +508,8 @@ const EVENT_TONE = {
   "job.unsatisfiable": "bad", "resource.quarantined": "bad",
   "job.requeued": "warn", "job.timed_out": "warn", "agent.draining": "warn",
   "job.cancelled": "warn",
-  "job.assigned": "busy", "job.started": "busy",
+  "job.assigned": "busy", "job.started": "busy", "job.submitted": "busy",
+  "job.reserving": "warn",
   "job.completed": "ok", "agent.registered": "ok",
   "agent.unquarantined": "ok", "resource.unquarantined": "ok",
 };
@@ -546,6 +547,15 @@ function eventDetail(event) {
       return `${who} → ${h(event.agent_id || "")} · ${(d.resource_ids || []).map(local).join(", ")}`;
     case "job.started":
       return `${who}${on}`;
+    case "job.submitted":
+      return d.feasible === false
+        ? `${who} — ${h(d.reason || "no bench in the fleet can satisfy this")}`
+        : `${who} — queued, ${h(d.resource_count)} device(s)`;
+    case "job.reserving":
+      return d.reserving
+        ? `${who} → RESERVING on ${h(event.agent_id || "")}` +
+          `${(d.resource_ids || []).length ? " · " + (d.resource_ids || []).map(local).join(", ") : ""}`
+        : `${who} — reservation released`;
     case "job.completed":
       return `${who} — ${h(stateWord(d.outcome || ""))}`;
     case "job.timed_out":

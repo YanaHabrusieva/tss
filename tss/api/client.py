@@ -202,18 +202,21 @@ async def submit_job(
             ),
         )
 
-    job_id = _submit_with_a_unique_id(store, req)
-    # Assessed with the SCHEDULER's own step-1 filter, not a second copy of the
-    # matching semantics: the answer at the door has to be the answer the queue
-    # will give, or this is just a different opinion delivered sooner.
+    # Assessed BEFORE the insert, with the SCHEDULER's own step-1 filter rather
+    # than a second copy of the matching semantics: the answer at the door has to
+    # be the answer the queue will give, or this is just a different opinion
+    # delivered sooner. Computed first so the verdict can ride along in the
+    # `job.submitted` event instead of being an API-only fact.
     feasible = bool(scheduler.feasible_agents(req.requirements))
+    reason = None if feasible else _infeasible_reason(store, req.requirements)
+    job_id = _submit_with_a_unique_id(store, req, feasible=feasible, infeasible_reason=reason)
     # Wake the scheduler now rather than waiting for the backstop tick.
     scheduler.notify()
     return SubmitResponse(
         job_id=job_id,
         queue_position=store.queue_position(job_id),
         feasible=feasible,
-        infeasible_reason=None if feasible else _infeasible_reason(store, req.requirements),
+        infeasible_reason=reason,
     )
 
 
@@ -225,7 +228,9 @@ async def submit_job(
 JOB_ID_HEX = 16
 
 
-def _submit_with_a_unique_id(store: Store, req: SubmitRequest) -> str:
+def _submit_with_a_unique_id(
+    store: Store, req: SubmitRequest, *, feasible: bool, infeasible_reason: str | None
+) -> str:
     """Insert the job, retrying once if the id collides.
 
     Belt and braces: the width above makes a collision vanishingly unlikely and
@@ -243,6 +248,8 @@ def _submit_with_a_unique_id(store: Store, req: SubmitRequest) -> str:
                 payload=req.payload,
                 priority=req.priority,
                 max_duration_s=req.max_duration_s,
+                feasible=feasible,
+                infeasible_reason=infeasible_reason,
             )
         except sqlite3.IntegrityError:
             log.warning("job id %s collided; retrying once", job_id)

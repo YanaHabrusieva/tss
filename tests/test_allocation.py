@@ -54,7 +54,9 @@ def assert_nothing_held(store, resource_ids, job_id):
     assert job.tried_agents == [], "a failed claim must not burn a retry slot"
     assert job.assigned_at is None
     assert store.allocation_records(job_id) == []
-    assert store.events(job_id=job_id) == []
+    # The submission's own event is not residue — it records that the job was
+    # asked for, which is still true. What must not exist is a CLAIM event.
+    assert [e.kind for e in store.events(job_id=job_id) if e.kind != "job.submitted"] == []
 
 
 def test_claim_takes_the_whole_set_and_bumps_the_epoch_once(store, bench, claim):
@@ -70,7 +72,7 @@ def test_claim_takes_the_whole_set_and_bumps_the_epoch_once(store, bench, claim)
     records = store.allocation_records("job-3dev")
     assert len(records) == 3
     assert {r["epoch"] for r in records} == {1}
-    assert [e.kind for e in store.events(job_id="job-3dev")] == ["job.assigned"]
+    assert [e.kind for e in store.events(job_id="job-3dev")] == ["job.submitted", "job.assigned"]
 
 
 def test_rollback_when_the_last_resource_is_already_busy(store, bench, claim):

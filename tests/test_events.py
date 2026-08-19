@@ -62,7 +62,7 @@ def test_events_are_published_only_after_the_transaction_commits(store, bus):
     assert result.ok
     assert [e.kind for e in published] == ["job.assigned"]
     # ...and what was published is exactly what was persisted.
-    assert [e.kind for e in store.events(job_id="job-A")] == ["job.assigned"]
+    assert [e.kind for e in store.events(job_id="job-A")] == ["job.submitted", "job.assigned"]
 
 
 def test_a_rolled_back_transaction_publishes_nothing(store, bus):
@@ -81,7 +81,9 @@ def test_a_rolled_back_transaction_publishes_nothing(store, bus):
 
     assert not lost.ok
     assert published == [], "a lost race announced itself"
-    assert store.events(job_id="job-B") == []
+    # Its submission committed and is on the record; the claim that lost the race
+    # is what must have left nothing behind.
+    assert [e.kind for e in store.events(job_id="job-B")] == ["job.submitted"]
 
 
 def test_a_failed_transaction_publishes_nothing(store, bus):

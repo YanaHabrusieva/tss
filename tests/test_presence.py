@@ -92,7 +92,11 @@ def test_re_registering_while_loaded_requeues_every_job_it_held(store):
     assert job.tried_agents == [AGENT], "the bench was recorded at claim time, not again here"
     assert store.resources_held_by("job-A") == []
     assert all(r.state == ResourceState.FREE for r in store.list_resources(AGENT))
-    assert [e.kind for e in store.events(job_id="job-A")] == ["job.assigned", "job.requeued"]
+    assert [e.kind for e in store.events(job_id="job-A")] == [
+        "job.submitted",
+        "job.assigned",
+        "job.requeued",
+    ]
 
 
 def test_re_registering_keeps_quarantine_unless_the_version_changed(store):

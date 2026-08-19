@@ -249,12 +249,15 @@ def test_a_job_no_bench_could_ever_run_reserves_nothing(store, scheduler, config
     job = store.get_job("job-impossible")
     assert job.state == JobState.QUEUED, "kept queued — fleets get repaired"
     assert job.blocked_reason == BLOCKED_NO_CAPABLE_AGENT
-    assert [e.kind for e in store.events(job_id="job-impossible")] == ["job.unsatisfiable"]
+    assert [e.kind for e in store.events(job_id="job-impossible")] == [
+        "job.submitted",
+        "job.unsatisfiable",
+    ]
     assert all(r.state == ResourceState.FREE for r in store.list_resources())
 
     # Said once, not once per pass.
     tick(scheduler, store, T0 + STARVED + 1)
-    assert len(store.events(job_id="job-impossible")) == 1
+    assert len(store.events(job_id="job-impossible", kind="job.unsatisfiable")) == 1
 
 
 def test_an_impossible_job_at_the_head_does_not_suppress_reservation_behind_it(
@@ -483,19 +486,31 @@ def test_reserving_by_claiming_deadlocks(store, config):
 
 def test_the_real_reservation_writes_nothing_to_the_database(store, scheduler, config):
     """The property that makes a crash mid-wait cost nothing: there is no trace
-    to clean up, and no schema column to migrate."""
+    to clean up, and no schema column to migrate.
+
+    A reservation now leaves ONE row in the append-only event log, announcing that
+    it happened so the live view can show it. That is not a trace of the
+    reservation and nothing reads it back: the state stays in scheduler memory,
+    every device stays `free` and owned by nobody, and a restart recomputes the
+    whole thing from the queue. An audit line is not a hold.
+    """
     devices = bench(store, "bench-01", devices=2)
     occupy(store, "bench-01", devices[:1])
     submit(store, "job-big", 2, now=T0, caps=VG)
 
     before = store.conn.execute("SELECT * FROM resources ORDER BY id").fetchall()
-    events_before = len(store.events())
     tick(scheduler, store, T0 + STARVED)
     after = store.conn.execute("SELECT * FROM resources ORDER BY id").fetchall()
 
     assert scheduler.reservation is not None
-    assert [dict(r) for r in before] == [dict(r) for r in after]
-    assert len(store.events()) == events_before, "a reservation is not an event either"
+    assert [dict(r) for r in before] == [dict(r) for r in after], (
+        "a reservation must not touch a single resource row"
+    )
+    assert store.get_job("job-big").state == JobState.QUEUED
+    assert store.get_job("job-big").agent_id is None
+    assert store.allocation_records("job-big") == [], "reserve is not claim"
+    announcements = [e for e in store.events() if e.kind == "job.reserving"]
+    assert len(announcements) == 1, "announced once, and only as an announcement"
 
     # A restart loses it, and that is fine: the next pass recomputes it.
     fresh = Scheduler(store, config)

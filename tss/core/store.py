@@ -1421,6 +1421,38 @@ class Store:
         return "unquarantined"
 
     # ------------------------------------------------------ unsatisfiable jobs
+    def record_reservation(
+        self,
+        *,
+        job_id: str,
+        agent_id: str | None,
+        resource_ids: Sequence[str] = (),
+        now: float | None = None,
+    ) -> None:
+        """A reservation started, moved bench, or ended (§3.4.1).
+
+        THE EVENT IS NOT THE RESERVATION. The reservation lives in scheduler
+        memory and deliberately leaves no database trace — writing one would make
+        a withheld device look owned, which is the exact confusion `reserve is not
+        claim` exists to prevent. This records that a transition HAPPENED, so the
+        live view can say `RESERVING on bench-01` at the moment it becomes true
+        instead of whenever something unrelated next pushes a snapshot.
+
+        Transitions only. The scheduler recomputes its reservation from scratch on
+        every pass, several times a second under load; announcing an unchanged
+        state would bury every event that did change.
+        """
+        self.append_event(
+            "job.reserving",
+            job_id=job_id,
+            agent_id=agent_id,
+            detail={
+                "reserving": agent_id is not None,
+                "resource_ids": sorted(resource_ids),
+            },
+            now=now,
+        )
+
     def set_blocked_reason(
         self, job_id: str, reason: str | None, *, now: float | None = None
     ) -> bool:
@@ -1740,33 +1772,62 @@ class Store:
         payload: dict[str, Any] | None = None,
         priority: int = 100,
         max_duration_s: int | None = None,
+        feasible: bool | None = None,
+        infeasible_reason: str | None = None,
         now: float | None = None,
     ) -> Job:
         """Queue a job. `resource_count` is len(requirements) — denormalized so
-        that I8 ("holds exactly what it required") is one cheap query (§5)."""
+        that I8 ("holds exactly what it required") is one cheap query (§5).
+
+        THE EVENT IS WRITTEN IN THE SAME TRANSACTION as the row, and published
+        after it commits, like every other state change (§3.6). Without it the
+        live view had no idea a job existed: the WebSocket pushes a snapshot
+        behind a burst of events, so on a quiet fleet the terminal said `queued —
+        position 1` while the page said `queue empty` until something unrelated
+        happened along. The first thing a new user does was the thing least
+        likely to appear.
+
+        `feasible` is the verdict the submit path already computed to answer the
+        caller (§3.4.1). Carrying it here costs nothing and stops the feed showing
+        an ordinary-looking arrival for a job no bench in the fleet can run. A
+        caller that did not assess — a test, the chaos generator — passes None and
+        the detail simply omits it rather than guessing.
+        """
         if not requirements:
             raise ValueError("a job must require at least one resource")
         now = time.time() if now is None else now
         max_duration_s = (
             self.config.default_max_duration_s if max_duration_s is None else max_duration_s
         )
-        self.conn.execute(
-            """INSERT INTO jobs
-                   (id, name, requirements, resource_count, payload, state,
-                    priority, max_duration_s, submitted_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                job_id,
-                name,
-                json.dumps(requirements),
-                len(requirements),
-                json.dumps(payload or {}),
-                str(JobState.QUEUED),
-                priority,
-                max_duration_s,
-                now,
-            ),
-        )
+        detail: dict[str, Any] = {"name": name, "resource_count": len(requirements)}
+        if feasible is not None:
+            detail["feasible"] = feasible
+            detail["reason"] = infeasible_reason
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """INSERT INTO jobs
+                       (id, name, requirements, resource_count, payload, state,
+                        priority, max_duration_s, submitted_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job_id,
+                    name,
+                    json.dumps(requirements),
+                    len(requirements),
+                    json.dumps(payload or {}),
+                    str(JobState.QUEUED),
+                    priority,
+                    max_duration_s,
+                    now,
+                ),
+            )
+            self._insert_event(conn, kind="job.submitted", ts=now, job_id=job_id, detail=detail)
+            self._commit(conn)
+        except BaseException:
+            self._rollback(conn)
+            raise
         job = self.get_job(job_id)
         assert job is not None
         return job

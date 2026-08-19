@@ -74,6 +74,8 @@ EVENT_STYLE = {
     "job.completed": "green",
     "job.assigned": "cyan",
     "job.started": "cyan",
+    "job.submitted": "cyan",
+    "job.reserving": "bold yellow",
 }
 
 
@@ -287,6 +289,11 @@ class FleetScreen:
             parts.append(str(detail.get("reason", "")))
         elif event["kind"] == "job.assigned":
             parts.append(",".join(r.split(":", 1)[-1] for r in detail.get("resource_ids", [])))
+        elif event["kind"] == "job.submitted":
+            parts.append("submitted" if detail.get("feasible", True) else "NO CAPABLE BENCH")
+        elif event["kind"] == "job.reserving":
+            held = ",".join(r.split(":", 1)[-1] for r in detail.get("resource_ids", []))
+            parts.append(f"RESERVING {held}".strip() if detail.get("reserving") else "released")
         return "  ".join(p for p in parts if p)
 
     async def run(self, console: Console | None = None) -> None:

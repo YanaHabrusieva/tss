@@ -100,7 +100,7 @@ class Scheduler:
         now = time.time() if now is None else now
         jobs = self.store.queued_jobs()
         if not jobs:
-            self.reservation = None  # nothing to starve, nothing to withhold
+            self._set_reservation(None, now)  # nothing to starve, nothing to withhold
             self.passes += 1
             return []
 
@@ -119,7 +119,9 @@ class Scheduler:
         # Reservations are computed FIRST (§3.4 step 2): the walk below has to
         # know which devices are being held for the starving job before it starts
         # handing them out.
-        self.reservation = self._recompute_reservation(jobs, installed_by_agent, free_by_agent, now)
+        self._set_reservation(
+            self._recompute_reservation(jobs, installed_by_agent, free_by_agent, now), now
+        )
         reserved = self.reservation.resource_ids if self.reservation else frozenset()
 
         results: list[ClaimResult] = []
@@ -236,6 +238,38 @@ class Scheduler:
         if previous is None or previous.job_id != starving.id:
             log.info("%s is starving; reserving on %s", starving.id, target)
         return Reservation(job_id=starving.id, agent_id=target, resource_ids=held, since=since)
+
+    def _set_reservation(self, reservation: Reservation | None, now: float) -> None:
+        """Adopt the recomputed reservation, announcing only a TRANSITION.
+
+        The reservation is recomputed from scratch every pass — that is what makes
+        "released the instant it stops being needed" a property of the design
+        rather than of a cleanup path — so the object is new every time even when
+        nothing has changed. Comparing (job, bench) is what turns a per-pass
+        recomputation into an event a human would recognise: it started, it moved,
+        or it stopped.
+
+        Deliberately keyed on the TARGET, not the held set. A device freeing on
+        the same bench grows the set without changing the sentence the page is
+        showing, and the live queue view carries the current devices anyway.
+        """
+        before, after = self.reservation, reservation
+        self.reservation = reservation
+        was = (before.job_id, before.agent_id) if before else None
+        now_is = (after.job_id, after.agent_id) if after else None
+        if was == now_is:
+            return
+        if before is not None and (after is None or after.job_id != before.job_id):
+            # Ending is a transition too: a page told only about the start goes on
+            # showing a reservation that stopped existing.
+            self.store.record_reservation(job_id=before.job_id, agent_id=None, now=now)
+        if after is not None:
+            self.store.record_reservation(
+                job_id=after.job_id,
+                agent_id=after.agent_id,
+                resource_ids=after.resource_ids,
+                now=now,
+            )
 
     def _starving_jobs(
         self, jobs: list[Job], free_by_agent: dict[str, list[Resource]], now: float

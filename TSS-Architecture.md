@@ -4,7 +4,61 @@
 **Target:** Samsara Automation Team — Building with AI exercise
 **Stack:** Python 3.12+ / FastAPI / SQLite (WAL) / httpx / Rich
 **Scope:** Single-process POC, correctness-first, with a documented evolution path to 1,000 agents across global offices.
-**Companion files:** `tss-system-diagram.html` (the section 5 diagram deliverable) · `CLAUDE-CODE-BRIEF.md` (build handoff)
+**Companion files:** `tss-system-diagram.html` (the rendered diagram) · `CLAUDE-CODE-BRIEF.md` (the
+original build handoff) · `design/tss-web-mockup.html` (the web view's design target)
+
+---
+
+## Summary
+
+**What TSS is.** A job broker for physical hardware. Firmware engineers submit test jobs that name
+the devices they need; machines with those devices cabled to them register their inventory and ask
+for work. TSS decides who runs what, and takes the job back when the machine holding it dies.
+
+**The three mechanisms that carry the design.** Everything else is a view onto them or an attack on
+them.
+
+1. **The two-level model** (§1.2). A bench is a machine; the devices cabled to it are the unit of
+   allocation. Two jobs run side by side on one bench as long as they need different devices. Model
+   this the other way round and you idle most of a fleet.
+2. **Presence lease plus fencing epoch** (§3.5). One question — *is this machine alive, and who owns
+   this job?* — answered by a lease the agent renews and an epoch stamped on every assignment.
+   Execution is at-least-once by design; authorization and the result are exactly-once.
+3. **All-or-nothing allocation** (§3.3). A job takes every device it needs in one transaction, or
+   none of them. Not a loop with cleanup: a crash mid-loop strands hardware with no owner and no
+   lease to expire it.
+
+**Where to look in the repo.**
+
+| You want | Look at |
+|---|---|
+| To run it | [`README.md`](README.md) |
+| The rules the code must not break | [`CLAUDE.md`](CLAUDE.md) — the nine invariants, and what follows from each |
+| Every write to the database | `tss/core/store.py` — the claim, the sweeps, the fencing |
+| The scheduling decision | `tss/core/scheduler.py` and `tss/core/matcher.py` |
+| Proof any of this holds | `tss/chaos/` — mock benches with failure profiles, a seeded runner, a ground-truth checker; `just chaos` is the merge gate |
+| How it was built with AI | [`AILOG.md`](AILOG.md) — the log is the commit history |
+
+---
+
+## Contents
+
+| § | Section | What is in it |
+|---|---|---|
+| [0](#0-the-one-paragraph-version) | The one-paragraph version | The whole system in a paragraph, and the design thesis |
+| [1](#1-requirements) | Requirements | Functional, non-functional, constraints — and **§1.2, the bench-vs-device distinction**, which the rest depends on |
+| [2](#2-component-map) | Component map | The parts and how data moves between them |
+| [3](#3-what-each-part-is-and-why-it-exists) | What each part is, and why | The long section: agent, API, store, matcher, scheduler, reaper, fencing, invariants, CLI |
+| [4](#4-state-machines) | State machines | Agent, resource and job lifecycles, and the transitions with no automatic path out |
+| [5](#5-data-model) | Data model | Tables, the columns that make invariants structural, and the indexes |
+| [6](#6-api-contracts) | API contracts | Every endpoint, what it promises, and what it refuses |
+| [7](#7-failure-semantics--the-decisions-worth-defending) | Failure semantics | FAILED vs INFRA_ERROR, the races that actually bite, retry and poison rules |
+| [8](#8-testing-strategy) | Testing strategy | The harnesses, what each is blind to, and sabotage as evidence |
+| [9](#9-scale-evolution-10--1000-agents-multiple-offices) | Scale evolution | 10 → 1,000 agents, in stages, with what breaks first |
+| [10](#10-build-order) | Build order | The order it was built in, and how the work was prioritized |
+| [11](#11-suggested-repo-layout) | Suggested repo layout | The original plan, kept as a record of what changed |
+| [12](#12-operational-qa--the-questions-this-design-expects) | Operational Q&A | The questions this design expects, and where each answer lives |
+| [13](#13-open-questions-to-decide-during-the-build) | Open questions | What was deliberately left undecided, and why |
 
 ---
 
@@ -637,7 +691,7 @@ profile** — plus a job generator that submits a mix of single- and multi-devic
 
 ```bash
 just chaos      # 15 agents × 2-4 devices, 100 jobs (30% multi-device), 5 seeds — the CI gate
-python -m tss.chaos --agents 15 --jobs 100 --multi-pct 30 --profile mixed --seed 42
+python -m tss.chaos.runner --agents 15 --jobs 100 --multi-pct 30 --profile mixed --seed 42
 ```
 
 **The profiles — each targets a specific design decision.**
@@ -654,15 +708,20 @@ python -m tss.chaos --agents 15 --jobs 100 --multi-pct 30 --profile mixed --seed
 | `resource_flap` | One device goes unhealthy while the machine stays alive | **Resource-level vs agent-level** health are different things |
 | `liar` | Declares capabilities its devices don't have | Graceful failure, not a crash; `infra_error`, then quarantine |
 | `flapper` | Registers/deregisters every few seconds | Registration idempotent; no duplicate resources; no orphaned jobs |
+| `deaf` | Its `/start` lands; the REPLY is discarded | **The inverse fence.** TSS holds a running job on a bench that never learned it owns one — the disagreement no lease can detect, because nothing is wrong with the bench |
 
 **Plus a load shape, not a profile: `--multi-pct`.** A fleet running only single-device jobs never
 exercises the N-way claim, the reservation logic, or the fan-out. Thirty percent multi-device jobs is
 what makes contention real, and it is the setting under which I8 and the starvation guard actually get
 tested.
 
-**Why `--seed`.** Reproducible chaos. When a run finds an invariant violation you need to replay that
-exact run to debug it. A chaos suite you can't replay is a chaos suite you can't fix. Log the seed on
-every run, including in CI.
+**Why `--seed`, and what it actually reproduces.** The seed fixes the WORKLOAD and the FLEET: which
+bench gets which profile, what inventory each has, every job spec, and every crash and dropped beat
+drawn from a profile's probabilities. It does **not** fix the schedule — the interleavings ride on
+real asyncio scheduling, real sockets and a real SQLite, so a replay re-runs the same *scenario*, not
+the same *execution*. That is enough to make a violation investigable and not enough to guarantee it
+recurs on the first try, which is why a failing run also dumps its full event log next to the seed.
+Log the seed on every run, including in CI.
 
 **Why this is the highest-leverage thing to build.** It is the demo. It is also the only way to find
 the concurrency bugs, because they are timing-dependent and will not show up in hand-testing. Build it
@@ -963,7 +1022,9 @@ CREATE TABLE resources (
     current_job_id    TEXT REFERENCES jobs(id),  -- single column ⇒ I2 is structural
     last_assigned_at  REAL,                    -- drives LRU (§3.4)
     consecutive_fails INTEGER NOT NULL DEFAULT 0,
-    quarantined_at    REAL
+    quarantined_at    REAL,
+    fault_reported_at REAL                     -- the bench called this device faulty while it was
+                                               -- BUSY; applied when the device is released (§4.2)
 );
 CREATE INDEX idx_res_dispatch ON resources(agent_id, state, last_assigned_at);
 CREATE INDEX idx_res_job      ON resources(current_job_id) WHERE current_job_id IS NOT NULL;
@@ -988,6 +1049,8 @@ CREATE TABLE jobs (
     started_at     REAL,
     finished_at    REAL,
     blocked_reason TEXT,                       -- 'no_capable_agent' — surfaced by `tss why`
+    blocked_since  REAL,                       -- when it BECAME unsatisfiable; the dead-letter
+                                               -- window runs from here, not from submission
     outcome        TEXT CHECK (outcome IS NULL OR outcome IN
                      ('passed','failed','infra_error','cancelled')),
     result_detail  TEXT                        -- 'timeout', 'agent_lost', 'no_capable_agent'
@@ -1090,9 +1153,16 @@ GET    /v1/jobs/{id}                status, including why-blocked and reservatio
 DELETE /v1/jobs/{id}                cancel. queued → CANCELLED. running → bump epoch + cancel
                                     directive + free resources. The epoch bump is what stops a
                                     late "PASSED" overwriting CANCELLED.
+GET    /v1/jobs/{id}/why           why that job is not running yet: which benches could ever run
+                                    it, which cannot and why, what it is waiting on, and whether it
+                                    is reserving (§3.9)
 GET    /v1/fleet                    agents, each with its resources and their states
 GET    /v1/queue                    queued and running jobs with wait times
-GET    /v1/stats                    utilization, throughput, requeue rate, quarantined devices
+GET    /v1/stats                    devices by state with utilization, jobs by state, a recent
+                                    completion window with throughput, requeues in that window,
+                                    quarantined benches and devices, event-bus drops, uptime.
+                                    Every figure read from rows already written — no counter is
+                                    kept on the claim, heartbeat or completion path for it.
 POST   /v1/agents/{id}/drain
 POST   /v1/agents/{id}/unquarantine
 POST   /v1/resources/{id}/unquarantine
@@ -1397,6 +1467,12 @@ firmware engineer loses when it's missing*, correctness before surface area:
 
 ## 11. Suggested repo layout
 
+> **This is the layout as originally planned, kept as a record of what changed between plan and
+> build. The tree is the authority.** `git ls-files` is the current answer; the differences are the
+> interesting part — `tss/cli/` grew a `submit.py` when the wrapper stopped being a one-liner,
+> `tss/api/static/` appeared with the web view, and `tests/` grew a foil meta-test that turned the
+> naive implementations from a demonstration into an assertion.
+
 ```
 tss/
 ├── README.md             # REQUIRED DELIVERABLE: how to run the service + mock agents
@@ -1447,9 +1523,14 @@ job, how to watch the TUI. Six commands someone can paste.
 
 ---
 
-## 12. Presentation plan (20 minutes)
+## 12. Operational Q&A — the questions this design expects
 
-The brief enumerates twelve sub-answers in twenty minutes. Budget the time or the demo eats it.
+Every design gets asked the same things: show me how it works, why is it built that way, what does
+it cost the person using it, and what happens when it grows. This section is the prepared answer to
+each, with a pointer to where the reasoning lives.
+
+**The original twenty-minute presentation budget** is kept below with the rest of the point-in-time
+material, because how the time was allocated is itself a statement about what matters.
 
 | Time | Section | Content |
 |---|---|---|
@@ -1461,7 +1542,7 @@ The brief enumerates twelve sub-answers in twenty minutes. Budget the time or th
 | 17:00–19:00 | Scale | §9, four stages + the fleet-health caveat |
 | 19:00–20:00 | Buffer | Something will run long. It's usually the demo. |
 
-| Their question | Your answer |
+| The question | Where the answer lives |
 |---|---|
 | 1a · diagram, component interaction | `tss-system-diagram.html` §1 + §2 here |
 | 1b · step-by-step demo and its value | Demo script, `CLAUDE-CODE-BRIEF.md` §7 |
@@ -1473,7 +1554,7 @@ The brief enumerates twelve sub-answers in twenty minutes. Budget the time or th
 | 3 · where AI was wrong | The five races in §7.3 — especially the acquire-in-a-loop allocation (§7.5) and the fan-out double-requeue. Show the generated code and your fix. |
 | 3a–c · process, start, key prompts | `CLAUDE-CODE-BRIEF.md` §1, §2, §6 |
 | 3d · how you knew it was good enough | §3.8 — nine invariants across every CI seed. A threshold, not a feeling. |
-| 3e · AI tooling kept permanently in the repo | `CLAUDE.md` with the invariants; pre-commit running ruff + the concurrency and allocation tests; chaos as a merge gate |
+| 3e · AI tooling kept permanently in the repo | `CLAUDE.md` with the invariants; `.pre-commit-config.yaml` running ruff check and ruff format on the way into a commit; the concurrency and allocation suites plus the foil meta-test and the chaos gate in CI |
 | 3f · AI in the loop vs deterministic | Scheduling is deterministic and must stay so — an allocator you can't reason about is unauditable. AI belongs in triage (classifying failures, spotting flaky devices), not in the allocation path. |
 | 4 · 10 → 1,000 agents | §9, four stages, plus the fleet-health caveat |
 

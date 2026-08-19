@@ -5,18 +5,25 @@ this project and it is worth stating plainly, because the alternative — a
 narrative written afterwards — is a summary of what someone remembers rather than
 a record of what happened.
 
-Every commit message in this repository carries three things:
+The commit messages carry, between them, three things:
 
-1. **the prompt** it was built from, as `prompt:` at the top;
+1. **the prompt** the work was built from. The build-step commits quote it
+   verbatim, as `prompt:` at the top. The later ones do not, and it would be a
+   nicer story than the truth to claim otherwise: once the system existed the
+   instructions became conversational — several paragraphs of review findings at
+   a time, argued back and forth — and pasting one into a commit message would
+   have been an edit, not a record. Those commits describe what was asked and
+   what was decided instead.
 2. **what the AI produced that was wrong**, named specifically — not "there were
    some issues", but which line, which assumption, and what it cost;
 3. **what was overridden and why**, including the places where the specification
    itself turned out to be wrong and was corrected in the same commit.
 
-Read in order, `git log --reverse` is the process: seven build steps, then three
-hardening commits from an adversarial review of the finished system. The
-messages are long on purpose. A one-line commit message would have made this
-file necessary.
+Read in order, `git log --reverse` is the process: the build steps, each one a
+demoable slice, and then a hardening tail — adversarial review, a chaos gate that
+had to be made honest about itself, and the defects that surfaced from doing
+that. The messages are long on purpose. A one-line commit message would have made
+this file necessary.
 
 What follows are four of them, **copied exactly**. They are the artifact; a
 paraphrase would be the thing this file exists to avoid.
@@ -192,12 +199,79 @@ synthetic-vs-real clock mismatch that cost three debugging rounds.
 
 ---
 
+## The sabotage exercise — planting bugs to find out what the harness misses
+
+*A green suite tells you the tests pass. It does not tell you they would have
+noticed. The only way to know is to break something on purpose and watch.*
+
+`git show f3c888a`
+
+```
+Then I sabotaged three things, and two got through.
+
+Removing the claim's state='free' guard: chaos passed, and structurally
+always will. One scheduler running one pass at a time never generates
+the interleaving — that race belongs to test_concurrency.py's 50
+threads. Chaos exercises failure, not concurrency.
+
+Removing the epoch check from /complete: chaos passed because agent_id
+IS NULL after a requeue blocks the stale report on its own. But a job
+requeued and reassigned to the SAME bench has a live agent_id and state
+again, and only the epoch separates attempt 1's late report from
+attempt 2's. Narrow enough that 100 jobs over 15 benches did not reach
+it — so the line is not redundant, the scenario was not generated.
+Written directly now as test_a_job_reassigned_to_the_SAME_bench_is_
+fenced_by_the_epoch_alone, confirmed to fail with the check removed.
+
+Freeing only the first device on release: this one found a real blind
+spot. I8 counted from the job's side only, so a device orphaned by a
+finished job balanced every check — the job is terminal, so it is never
+examined. Added the converse direction: every current_job_id must point
+at a job still assigned or running. It now names the device and the
+finished job holding it, and sabotaging the reaper's release instead
+produces 38 violations across I5 and I8.
+```
+
+Two of the three sabotages survived, and neither survival was the same kind of
+problem. The first was **the wrong harness**: a concurrency bug that a
+single-threaded chaos run cannot produce, and which the threaded allocation tests
+catch on every run. The second was **a scenario nobody generated**: the check was
+load-bearing, but the specific shape that needs it — a job requeued back onto the
+bench it just left — did not occur in a hundred jobs across fifteen benches, so it
+got a directly-written test instead. Only the third was a genuine gap in a check,
+and fixing it added the converse direction of I8.
+
+The habit stuck, and it is now how this repo justifies any claim about its own
+tests. `TSS-Architecture.md` §8.1 states the rule — *a checker nobody has seen
+fail is not evidence* — and the two commits after it are the rule applied at
+larger scale: `git show f501ad4` neuters each chaos profile in turn to prove
+every one of them can fail the gate, and `git show 8a90199` fixes the defect that
+exercise surfaced.
+
+---
+
+## The design artifacts
+
+Three files in this repository are inputs and targets rather than code, and each
+is kept as it was rather than tidied to match the result:
+
+- **`tss-system-diagram.html`** — the rendered system diagram: components and data
+  flow, the two-level allocation model, a bench dying mid-job, and the state
+  machines.
+- **`CLAUDE-CODE-BRIEF.md`** — the original build handoff, written before any code
+  existed. Its per-step prompts are what drove the early commits; where it and the
+  tree disagree, the tree is right and the disagreement is part of the record.
+- **`design/tss-web-mockup.html`** — the design target for the web view at `/`. The
+  page was built to match it and is still checked against it; the mockup was
+  updated once during the build, and the page and the target moved in the same
+  commit.
+
+---
+
 ## The full record
 
-Four messages is a sample. The rest are in the history, and the ones not
-excerpted here include the sabotage exercise (§8.1 of `TSS-Architecture.md`),
-where deliberately breaking three things showed that two of them were caught by
-nothing — and what was added as a result.
+Four build messages and one sabotage excerpt are a sample. The rest are in the
+history.
 
 ```bash
 git log --reverse                 # the whole process, in order
@@ -209,9 +283,20 @@ Two conventions worth knowing when reading it:
 
 - **Foils are kept, not deleted.** `tests/naive_claim.py`, `naive_reap.py`,
   `naive_scheduler.py` and `naive_reservation.py` are the wrong implementations
-  the AI produced first. `just test-naive` runs the real suite against them and
-  they fail — which is the only evidence that the tests catch what they were
-  written for.
+  the AI produced first, and they still fail the tests written to catch them —
+  which is the only evidence those tests catch anything.
+
+  How they run is worth being exact about, because it changed. `just test-naive`
+  swaps in the claim, fan-out and scheduler foils through environment variables
+  and prints the failures for a human to read; the reservation foil is not wired
+  to a variable at all, but instantiated directly inside `tests/test_starvation.py`,
+  where the deadlock it causes is the assertion. That recipe was a demonstration
+  and not a guarantee — every line of it is dash-prefixed, so it exits 0 whether
+  the foils fail or pass. Since the chaos-gate commit, `tests/test_foils.py` is
+  the guarantee: it runs every foil environment, including the release-on-failure
+  claim variant that the recipe never reached, in a clean subprocess and requires
+  a **non-zero** exit. It runs in CI, so a foil that starts passing fails the
+  build.
 - **Corrections to the specification are in the commit that made them.**
   `TSS-Architecture.md` was edited during the build several times; each edit is
   argued in the message of the commit that changed the code alongside it.

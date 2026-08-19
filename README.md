@@ -8,11 +8,18 @@ heartbeating. If an agent stops heartbeating, its lease expires, TSS marks it of
 every job holding any of its devices and re-queues them. A bench is not the unit of allocation: two
 jobs run side by side on one machine as long as they need different devices.
 
-- **Design and reasoning:** [`TSS-Architecture.md`](TSS-Architecture.md)
+- **Design and reasoning:** [`TSS-Architecture.md`](TSS-Architecture.md) — starts with a summary and
+  a table of contents
 - **Invariants and the rules that follow from them:** [`CLAUDE.md`](CLAUDE.md)
-- **How it was built with AI:** [`AILOG.md`](AILOG.md) — the log is the commit history; every
-  message carries the prompt, what the AI got wrong, and what was overridden. `AILOG.md` explains
-  the convention and quotes four of them verbatim.
+- **How it was built with AI:** [`AILOG.md`](AILOG.md) — the log is the commit history. The
+  build-step messages carry the prompt verbatim; all of them carry what the AI got wrong and what was
+  overridden. `AILOG.md` explains the convention and quotes several in full, including the sabotage
+  exercise.
+- **The diagram:** [`tss-system-diagram.html`](tss-system-diagram.html) — components and data flow,
+  the two-level allocation model, a bench dying mid-job, and the state machines
+- **The original build handoff:** [`CLAUDE-CODE-BRIEF.md`](CLAUDE-CODE-BRIEF.md) — written before any
+  code existed and deliberately not rewritten since
+- **Licence:** [MIT](LICENSE)
 
 ---
 
@@ -99,11 +106,16 @@ in `.demo-logs/NAME.log` so the terminal stays readable.
 just submit smoke 1 0                 # one vehicle gateway
 just submit gateway-to-gateway 2 0    # TWO vehicle gateways, both on ONE bench
 just submit mixed 1 1                 # one of each — needs a bench that has both
+just submit soak 1 0 120              # long enough to still be there when you look
 just fleet                            # benches with their devices
 just queue                            # what is running, what is waiting
 just watch                            # the live view — this is the one to have on screen
-just why smoke                        # why is that job not running yet?
+just why soak                         # where is that job, and what is it waiting for?
 ```
+
+`tss why` answers from the live queue, so ask about a job that is still in it — a ten-second job has
+finished and left before you can type the question. Finished jobs are still there by full id
+(`just why job-24778...`); everything else takes the short id or the name off the screen.
 
 `just submit NAME VG AG DURATION` takes its counts in the same order as `just add NAME VG AG`:
 a name, vehicle gateways, asset gateways, then how long. If no bench in the fleet could ever run
@@ -245,15 +257,22 @@ just chaos         # the merge gate — 5 seeds, zero invariant violations
 just test-naive    # the deliberately-wrong implementations. FAILURES ARE THE POINT.
 ```
 
-`just test-naive` runs the real test suite against four foils kept in `tests/`: a check-then-act
-claim, a fan-out that requeues per device instead of per job, a scheduler that clears its wakeup flag
-after a pass instead of before, and a reservation that takes hardware instead of withholding it. They
-all fail, which is the evidence that the tests catch what they were written for.
+Four deliberately-wrong implementations are kept in `tests/`: a check-then-act claim (in two
+variants, the second with the release-on-failure cleanup that looks fine in review), a fan-out that
+requeues per device instead of per job, a scheduler that clears its wakeup flag after a pass instead
+of before, and a reservation that takes hardware instead of withholding it. They fail the tests that
+were written to catch them, which is the evidence those tests catch anything at all.
 
-That recipe is for reading; `tests/test_foils.py` is the assertion. Every line of `just test-naive`
-is dash-prefixed, so it exits 0 whether the foils fail or pass — it could not tell you the tests had
-lost their teeth. The meta-test runs each foil in a subprocess with a clean environment and requires
-a non-zero exit, so a foil that starts passing fails the build. It runs in CI.
+`just test-naive` is the human-facing demonstration — it swaps in the claim, fan-out and scheduler
+foils and prints the failures for you to read. The reservation foil is not wired to an environment
+variable; it is instantiated directly inside `tests/test_starvation.py`, where the deadlock it causes
+is the assertion.
+
+The demonstration is not the guarantee. Every line of that recipe is dash-prefixed, so it exits 0
+whether the foils fail or pass — it could not tell you the tests had lost their teeth.
+`tests/test_foils.py` is the assertion: it runs each foil environment in a subprocess with a clean
+environment and requires a **non-zero** exit, so a foil that starts passing fails the build. It runs
+in CI.
 
 `just chaos` fails on four things, not one: any invariant violation, any job that never reached a
 terminal state, **any profile that did not fire**, and **any run whose safety checks stopped
@@ -275,7 +294,8 @@ fixes the workload and the fleet — which bench gets which profile, every job s
 dropped beat — but **not** the interleaving, which rides on real asyncio scheduling, real sockets and
 a real SQLite. A replay re-runs the scenario, not the schedule.
 
-CI runs lint, the suite, and the chaos gate on every push
+CI runs lint, the suite, the foil meta-test and the chaos gate on every push to `main` and on every
+pull request
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ---
@@ -288,17 +308,31 @@ CI runs lint, the suite, and the chaos gate on every push
 | `tss/api/` | `/v1/agents/*` for benches, `/v1/jobs`, `/v1/fleet`, `/v1/queue`, `/v1/stats` for humans, `WS /v1/events`, and `/` — the web view, one file in `api/static/` |
 | `tss/agent/` | the daemon that runs on a bench: register, heartbeat, run, report |
 | `tss/chaos/` | mock benches with failure profiles, the seeded runner, the ground-truth checker |
-| `tss/cli/` | `tss fleet | queue | watch | why` |
+| `tss/cli/` | `tss fleet \| queue \| watch \| why \| drain \| unquarantine \| cancel`, and the `just submit` wrapper |
 
 The `events` table is append-only and never pruned: retention and archival are deliberately out of
 scope for the POC, the same call as schema migrations (`TSS-Architecture.md` §13.6). Its hot paths
 are indexed so the fleet view and the invariant checker do not degrade as it grows, but on a
 long-running deployment it grows without bound and would need a retention policy.
 
-Nine invariants hold across every seed the chaos gate runs. Seven are database or scheduler
-properties (`tss/core/invariants.py`); **I1** — at most one agent is authorized to own a job, and
-exactly one result is ever accepted — and **I4** — a job never runs on devices lacking its required
-capabilities — cannot be checked against TSS's database at all, because TSS's record of what a device
-is capable of is precisely what that agent claimed. Those two are checked against the mock agents'
-ground truth (`tss/chaos/invariants.py`). See [`CLAUDE.md`](CLAUDE.md) for the list and
-[`TSS-Architecture.md`](TSS-Architecture.md) §3.8 for why each is worded the way it is.
+Nine invariants hold across every seed the chaos gate runs, and where each one is checked follows
+from what can answer it.
+
+Most are properties of the database and the scheduler, so they are read straight out of them
+(`tss/core/invariants.py`): no device held by two jobs, an offline bench holding nothing, a job in
+flight holding exactly the devices it asked for and no orphans pointing back at it, hung jobs ended
+by the timeout sweep rather than by presence expiry, terminal outcomes never overwritten, and at
+most one reservation at a time on one feasible bench.
+
+Two cannot be checked against TSS's database at all. **I1** — at most one agent is authorized to own
+a job, and exactly one result is ever accepted — and **I4** — a job never runs on devices lacking its
+required capabilities — are questions about what is true on the bench, and TSS's record of what a
+device is capable of is precisely what that agent claimed. Both are checked against the mock agents'
+ground truth (`tss/chaos/invariants.py`).
+
+**I3** is different again: every submitted job reaches a terminal state. That is liveness, so it is
+not true at any given instant and cannot be sampled — it is checked once, at the end of a run,
+against the list of jobs that were actually submitted (also `tss/chaos/invariants.py`).
+
+See [`CLAUDE.md`](CLAUDE.md) for the list and [`TSS-Architecture.md`](TSS-Architecture.md) §3.8 for
+why each is worded the way it is.

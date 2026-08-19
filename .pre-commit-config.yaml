@@ -1,0 +1,17 @@
+# The same two commands `just lint` runs and CI enforces, on the way into a
+# commit rather than on the way out of one. Deliberately nothing else: tests and
+# the chaos gate take minutes, and a pre-commit hook people disable to get work
+# done is worse than no hook.
+#
+#   uv tool install pre-commit && pre-commit install
+#
+# The rev matches the ruff pinned in uv.lock, so the hook and `just lint` cannot
+# disagree about what the code should look like — two formatters with different
+# opinions is worse than none.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.3
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format

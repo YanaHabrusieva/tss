@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TSS — System Architecture</title>
+<style>
+  :root{
+    --bg:#FAFAF9; --panel:#FFFFFF; --ink:#191917; --ink2:#57564F; --ink3:#8A8880;
+    --line:#DFDDD6;
+    --core:#2F5FD0; --core-bg:#EEF2FD; --core-line:#B9C9F2;
+    --agent:#15795A; --agent-bg:#EBF6F1; --agent-line:#AEDBC9;
+    --warn:#A65A0B; --warn-bg:#FDF3E7; --warn-line:#F0CFA4;
+    --fail:#B4342C; --fail-bg:#FCEEEC; --fail-line:#F0C0BB;
+    --user:#6B4BB8; --user-bg:#F2EEFB; --user-line:#D2C6F0;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#17171A; --panel:#1F1F23; --ink:#F0EFEA; --ink2:#B4B2AA; --ink3:#84827B;
+      --line:#33333A;
+      --core:#8FB0FF; --core-bg:#1B2540; --core-line:#33477A;
+      --agent:#6FD3AC; --agent-bg:#13291F; --agent-line:#2A5943;
+      --warn:#F0B168; --warn-bg:#2E2214; --warn-line:#5E4526;
+      --fail:#F2938A; --fail-bg:#2E1A18; --fail-line:#5E322D;
+      --user:#B9A2F0; --user-bg:#241E38; --user-line:#453A6B;
+    }
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1220px;margin:0 auto;padding:44px 24px 80px}
+  header{margin-bottom:40px;border-bottom:1px solid var(--line);padding-bottom:24px}
+  h1{font-size:27px;letter-spacing:-.02em;margin:0 0 8px;font-weight:640}
+  .sub{color:var(--ink2);font-size:15px;margin:0;max-width:72ch}
+  .tag{display:inline-block;font-size:11.5px;letter-spacing:.07em;text-transform:uppercase;
+       color:var(--ink3);font-weight:600;margin-bottom:12px}
+  section{margin-top:52px}
+  h2{font-size:19px;letter-spacing:-.01em;margin:0 0 6px;font-weight:620}
+  .lede{color:var(--ink2);margin:0 0 22px;max-width:78ch;font-size:14.5px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+        padding:22px 20px;overflow-x:auto}
+  svg{display:block;max-width:100%;height:auto}
+  .legend{display:flex;flex-wrap:wrap;gap:18px;margin-top:18px;font-size:13px;color:var(--ink2)}
+  .legend span{display:flex;align-items:center;gap:7px}
+  .sw{width:11px;height:11px;border-radius:3px;display:inline-block}
+  .note{margin-top:18px;font-size:13.5px;color:var(--ink2);border-left:2px solid var(--line);
+        padding-left:14px;max-width:80ch}
+  .note b{color:var(--ink);font-weight:600}
+  code{font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+       background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+  footer{margin-top:64px;padding-top:20px;border-top:1px solid var(--line);
+         color:var(--ink3);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="tag">Test Scheduling Service</div>
+  <h1>TSS — fleet architecture</h1>
+  <p class="sub">A job broker for physical hardware. A testbed <em>agent</em> is a machine; the
+  <em>resources</em> it owns are the devices cabled to it. Agents register themselves and their inventory;
+  jobs declare which devices they need; the scheduler claims all of them or none, and hands the owning
+  machine a time-limited lease. Every failure reduces to one question — <em>is this machine alive, and who
+  owns these devices?</em></p>
+</header>
+
+<!-- ══════════════ 1. BLOCK DIAGRAM ══════════════ -->
+<section>
+  <h2>1 · Components and data flow</h2>
+  <p class="lede">Agents always dial <em>out</em>. TSS never opens a connection into a testbed — that is what
+  makes the design work across offices behind NAT, and it is the decision everything else rests on.</p>
+
+  <div class="card">
+  <svg viewBox="0 0 1140 800" role="img" aria-label="TSS component diagram">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--ink3)"/>
+      </marker>
+      <marker id="arc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--core)"/>
+      </marker>
+      <marker id="arg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--agent)"/>
+      </marker>
+    </defs>
+
+    <!-- clients -->
+    <rect x="250" y="24" width="270" height="66" rx="9" fill="var(--user-bg)" stroke="var(--user-line)"/>
+    <text x="385" y="50" text-anchor="middle" font-size="14.5" font-weight="640" fill="var(--user)">Firmware Engineer</text>
+    <text x="385" y="70" text-anchor="middle" font-size="12.5" fill="var(--ink2)">tss fleet · queue · watch · why</text>
+
+    <rect x="620" y="24" width="270" height="66" rx="9" fill="var(--user-bg)" stroke="var(--user-line)"/>
+    <text x="755" y="50" text-anchor="middle" font-size="14.5" font-weight="640" fill="var(--user)">CI pipeline</text>
+    <text x="755" y="70" text-anchor="middle" font-size="12.5" fill="var(--ink2)">POST /v1/jobs · WS /v1/events</text>
+
+    <path d="M385 90 L385 166" stroke="var(--ink3)" stroke-width="1.4" marker-end="url(#ar)" fill="none"/>
+    <path d="M755 90 L755 166" stroke="var(--ink3)" stroke-width="1.4" marker-end="url(#ar)" fill="none"/>
+    <text x="570" y="132" text-anchor="middle" font-size="12" fill="var(--ink3)">HTTP · WebSocket</text>
+
+    <!-- TSS core -->
+    <rect x="120" y="170" width="900" height="316" rx="14" fill="var(--core-bg)" stroke="var(--core-line)" stroke-width="1.5"/>
+    <text x="146" y="197" font-size="11.5" font-weight="700" letter-spacing="1.1" fill="var(--core)">TSS CORE — single FastAPI process</text>
+
+    <rect x="152" y="214" width="216" height="102" rx="9" fill="var(--panel)" stroke="var(--core-line)"/>
+    <text x="260" y="243" text-anchor="middle" font-size="14" font-weight="640" fill="var(--ink)">API</text>
+    <text x="260" y="264" text-anchor="middle" font-size="12" fill="var(--ink2)">/v1/agents · /v1/jobs</text>
+    <text x="260" y="282" text-anchor="middle" font-size="12" fill="var(--ink2)">/v1/fleet · /v1/events</text>
+    <text x="260" y="302" text-anchor="middle" font-size="11.5" font-style="italic" fill="var(--ink3)">validates, never decides</text>
+
+    <rect x="422" y="214" width="216" height="102" rx="9" fill="var(--panel)" stroke="var(--core-line)"/>
+    <text x="530" y="243" text-anchor="middle" font-size="14" font-weight="640" fill="var(--ink)">SCHEDULER</text>
+    <text x="530" y="264" text-anchor="middle" font-size="12" fill="var(--ink2)">N-of-M resource match</text>
+    <text x="530" y="282" text-anchor="middle" font-size="12" fill="var(--ink2)">LRU · reservations</text>
+    <text x="530" y="302" text-anchor="middle" font-size="11.5" font-style="italic" fill="var(--ink3)">pure decision, no I/O</text>
+
+    <rect x="692" y="214" width="216" height="102" rx="9" fill="var(--panel)" stroke="var(--core-line)"/>
+    <text x="800" y="243" text-anchor="middle" font-size="14" font-weight="640" fill="var(--ink)">STATE STORE</text>
+    <text x="800" y="264" text-anchor="middle" font-size="12" fill="var(--ink2)">SQLite (WAL)</text>
+    <text x="800" y="282" text-anchor="middle" font-size="12" font-weight="600" fill="var(--core)">all-or-nothing claim</text>
+    <text x="800" y="302" text-anchor="middle" font-size="11.5" font-style="italic" fill="var(--ink3)">single source of truth</text>
+
+    <rect x="152" y="356" width="216" height="94" rx="9" fill="var(--panel)" stroke="var(--core-line)"/>
+    <text x="260" y="385" text-anchor="middle" font-size="14" font-weight="640" fill="var(--ink)">EVENT BUS</text>
+    <text x="260" y="406" text-anchor="middle" font-size="12" fill="var(--ink2)">pub/sub → WebSocket</text>
+    <text x="260" y="426" text-anchor="middle" font-size="11.5" font-style="italic" fill="var(--ink3)">push, not poll</text>
+
+    <rect x="422" y="356" width="216" height="94" rx="9" fill="var(--warn-bg)" stroke="var(--warn-line)"/>
+    <text x="530" y="382" text-anchor="middle" font-size="14" font-weight="640" fill="var(--warn)">REAPER</text>
+    <text x="530" y="402" text-anchor="middle" font-size="12" fill="var(--ink2)">every 2s: presence + timeouts</text>
+    <text x="530" y="422" text-anchor="middle" font-size="12" font-weight="600" fill="var(--warn)">→ fan-out requeue · epoch++</text>
+
+    <path d="M368 265 L418 265" stroke="var(--core)" stroke-width="1.4" marker-end="url(#arc)" fill="none"/>
+    <path d="M638 265 L688 265" stroke="var(--core)" stroke-width="1.4" marker-end="url(#arc)" fill="none"/>
+    <path d="M638 400 L800 400 L800 320" stroke="var(--warn)" stroke-width="1.4" marker-end="url(#arc)" fill="none" stroke-dasharray="5 3"/>
+    <path d="M530 352 L530 320" stroke="var(--warn)" stroke-width="1.4" marker-end="url(#arc)" fill="none"/>
+    <path d="M418 403 L372 403" stroke="var(--ink3)" stroke-width="1.4" marker-end="url(#ar)" fill="none"/>
+    <path d="M260 352 L260 320" stroke="var(--ink3)" stroke-width="1.4" marker-end="url(#ar)" fill="none"/>
+
+    <!-- transport band -->
+    <path d="M300 486 L300 566" stroke="var(--agent)" stroke-width="1.6" marker-end="url(#arg)" marker-start="url(#arg)" fill="none"/>
+    <path d="M840 486 L840 566" stroke="var(--agent)" stroke-width="1.6" marker-end="url(#arg)" marker-start="url(#arg)" fill="none"/>
+    <rect x="330" y="504" width="480" height="46" rx="8" fill="var(--agent-bg)" stroke="var(--agent-line)"/>
+    <text x="570" y="522" text-anchor="middle" font-size="12.5" font-weight="640" fill="var(--agent)">↑ agents PULL — long-poll heartbeat (3s, blocks 8s with spare capacity)</text>
+    <text x="570" y="540" text-anchor="middle" font-size="12.5" fill="var(--ink2)">↓ response carries the resource set + epoch</text>
+
+    <!-- agents with resources -->
+    <g font-size="11">
+      <!-- bench 1 -->
+      <rect x="120" y="580" width="210" height="140" rx="9" fill="var(--agent-bg)" stroke="var(--agent-line)"/>
+      <text x="225" y="602" text-anchor="middle" font-size="13" font-weight="640" fill="var(--agent)">bench-sf-01</text>
+      <rect x="134" y="612" width="182" height="30" rx="5" fill="var(--core-bg)" stroke="var(--core-line)"/>
+      <text x="144" y="631" fill="var(--ink2)">vg-01 · j1939</text><text x="306" y="631" text-anchor="end" font-weight="700" fill="var(--core)">BUSY</text>
+      <rect x="134" y="646" width="182" height="30" rx="5" fill="var(--panel)" stroke="var(--agent-line)"/>
+      <text x="144" y="665" fill="var(--ink2)">vg-02 · obd2</text><text x="306" y="665" text-anchor="end" font-weight="700" fill="var(--agent)">free</text>
+      <rect x="134" y="680" width="182" height="30" rx="5" fill="var(--panel)" stroke="var(--agent-line)"/>
+      <text x="144" y="699" fill="var(--ink2)">ag-01</text><text x="306" y="699" text-anchor="end" font-weight="700" fill="var(--agent)">free</text>
+
+      <!-- bench 2 -->
+      <rect x="350" y="580" width="210" height="140" rx="9" fill="var(--agent-bg)" stroke="var(--agent-line)"/>
+      <text x="455" y="602" text-anchor="middle" font-size="13" font-weight="640" fill="var(--agent)">bench-ams-04</text>
+      <rect x="364" y="612" width="182" height="30" rx="5" fill="var(--core-bg)" stroke="var(--core-line)"/>
+      <text x="374" y="631" fill="var(--ink2)">vg-01 · j1939</text><text x="536" y="631" text-anchor="end" font-weight="700" fill="var(--core)">BUSY</text>
+      <rect x="364" y="646" width="182" height="30" rx="5" fill="var(--core-bg)" stroke="var(--core-line)"/>
+      <text x="374" y="665" fill="var(--ink2)">ag-01</text><text x="536" y="665" text-anchor="end" font-weight="700" fill="var(--core)">BUSY</text>
+      <text x="455" y="700" text-anchor="middle" font-size="11" font-style="italic" fill="var(--core)">↑ one job, two devices</text>
+
+      <!-- bench 3 offline -->
+      <rect x="580" y="580" width="210" height="140" rx="9" fill="var(--fail-bg)" stroke="var(--fail-line)"/>
+      <text x="685" y="602" text-anchor="middle" font-size="13" font-weight="640" fill="var(--fail)">bench-ams-03</text>
+      <text x="685" y="628" text-anchor="middle" fill="var(--ink2)">last beat 15s ago</text>
+      <text x="685" y="652" text-anchor="middle" font-size="12" font-weight="700" fill="var(--fail)">OFFLINE</text>
+      <text x="685" y="676" text-anchor="middle" fill="var(--ink2)">3 devices freed</text>
+      <text x="685" y="698" text-anchor="middle" fill="var(--ink2)">2 jobs requeued</text>
+
+      <!-- mock -->
+      <rect x="810" y="580" width="210" height="140" rx="9" fill="var(--warn-bg)" stroke="var(--warn-line)" stroke-dasharray="4 3"/>
+      <text x="915" y="602" text-anchor="middle" font-size="13" font-weight="640" fill="var(--warn)">mock-11</text>
+      <text x="915" y="628" text-anchor="middle" fill="var(--ink2)">chaos: crasher · p = 0.3</text>
+      <text x="915" y="652" text-anchor="middle" fill="var(--ink2)">vg-01 BUSY · vg-02 BUSY</text>
+      <text x="915" y="676" text-anchor="middle" fill="var(--ink2)">ag-01 unhealthy</text>
+      <text x="915" y="700" text-anchor="middle" font-size="11" font-style="italic" fill="var(--warn)">dies → 2 jobs fan out</text>
+    </g>
+
+    <text x="225" y="748" text-anchor="middle" font-size="11.5" letter-spacing=".6" font-weight="700" fill="var(--ink3)">REAL TESTBEDS — ONE AGENT, SEVERAL DEVICES</text>
+    <text x="915" y="748" text-anchor="middle" font-size="11.5" letter-spacing=".6" font-weight="700" fill="var(--ink3)">CHAOS FLEET</text>
+    <path d="M120 762 L790 762" stroke="var(--line)" stroke-width="2"/>
+    <path d="M810 762 L1020 762" stroke="var(--line)" stroke-width="2"/>
+  </svg>
+
+  <div class="legend">
+    <span><i class="sw" style="background:var(--user)"></i>humans &amp; CI</span>
+    <span><i class="sw" style="background:var(--core)"></i>TSS core · claimed devices</span>
+    <span><i class="sw" style="background:var(--warn)"></i>lease / failure handling</span>
+    <span><i class="sw" style="background:var(--agent)"></i>agents &amp; free devices</span>
+    <span><i class="sw" style="background:var(--fail)"></i>dead / reaped</span>
+  </div>
+  </div>
+
+  <p class="note"><b>The one thing to say out loud about this diagram:</b> the arrow between core and agents
+  points <em>up first</em>. Agents dial out; TSS answers. That single choice is why this works through office
+  NAT, why an agent only takes work when its hardware is genuinely ready, and why scaling to offices in three
+  countries needs no firewall rules at all.</p>
+</section>
+
+<!-- ══════════════ 2. UNIT OF ALLOCATION ══════════════ -->
+<section>
+  <h2>2 · The unit of allocation — a bench is not one thing</h2>
+  <p class="lede">Liveness is a property of the <em>machine</em>; allocation is a property of the
+  <em>device</em>. Two jobs share one bench freely as long as they need disjoint devices — but a job never
+  holds part of what it needs. That rule is the deadlock prevention. Keeping a job on one bench is
+  <em>not</em> — see the note below.</p>
+
+  <div class="card">
+  <svg viewBox="0 0 1140 340" role="img" aria-label="Resource-level allocation and the partial-allocation deadlock">
+    <defs>
+      <marker id="ar4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--ink3)"/>
+      </marker>
+      <marker id="arf4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--fail)"/>
+      </marker>
+      <marker id="arg4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--agent)"/>
+      </marker>
+    </defs>
+
+    <!-- LEFT: concurrent jobs on one bench -->
+    <text x="30" y="26" font-size="11.5" font-weight="700" letter-spacing="1.1" fill="var(--ink3)">WORKS — DISJOINT DEVICE SETS</text>
+
+    <rect x="30" y="46" width="290" height="200" rx="10" fill="var(--agent-bg)" stroke="var(--agent-line)"/>
+    <text x="175" y="72" text-anchor="middle" font-size="13.5" font-weight="640" fill="var(--agent)">bench-sf-01</text>
+
+    <rect x="46" y="86" width="258" height="42" rx="6" fill="var(--core-bg)" stroke="var(--core-line)"/>
+    <text x="60" y="103" font-size="12" font-weight="640" fill="var(--ink)">vg-01</text>
+    <text x="60" y="120" font-size="11" fill="var(--ink2)">vehicle_gateway · j1939</text>
+
+    <rect x="46" y="136" width="258" height="42" rx="6" fill="var(--core-bg)" stroke="var(--core-line)"/>
+    <text x="60" y="153" font-size="12" font-weight="640" fill="var(--ink)">ag-01</text>
+    <text x="60" y="170" font-size="11" fill="var(--ink2)">asset_gateway</text>
+
+    <rect x="46" y="186" width="258" height="42" rx="6" fill="var(--warn-bg)" stroke="var(--warn-line)"/>
+    <text x="60" y="203" font-size="12" font-weight="640" fill="var(--ink)">vg-02</text>
+    <text x="60" y="220" font-size="11" fill="var(--ink2)">vehicle_gateway · obd2</text>
+
+    <path d="M320 107 L392 128" stroke="var(--core)" stroke-width="1.4" fill="none" marker-end="url(#arc)"/>
+    <path d="M320 157 L392 140" stroke="var(--core)" stroke-width="1.4" fill="none" marker-end="url(#arc)"/>
+    <path d="M320 207 L392 207" stroke="var(--warn)" stroke-width="1.4" fill="none" marker-end="url(#arc)"/>
+
+    <rect x="396" y="108" width="168" height="52" rx="8" fill="var(--core-bg)" stroke="var(--core-line)"/>
+    <text x="480" y="128" text-anchor="middle" font-size="12.5" font-weight="640" fill="var(--core)">job-A · 2 devices</text>
+    <text x="480" y="146" text-anchor="middle" font-size="11" fill="var(--ink2)">VG + AG, gateway pairing</text>
+
+    <rect x="396" y="184" width="168" height="46" rx="8" fill="var(--warn-bg)" stroke="var(--warn-line)"/>
+    <text x="480" y="204" text-anchor="middle" font-size="12.5" font-weight="640" fill="var(--warn)">job-B · 1 device</text>
+    <text x="480" y="221" text-anchor="middle" font-size="11" fill="var(--ink2)">running concurrently</text>
+
+    <text x="30" y="278" font-size="12.5" fill="var(--ink2)">Bench-level allocation would run <tspan font-weight="640" fill="var(--ink)">one</tspan> of these and idle the rest.</text>
+    <text x="30" y="300" font-size="12.5" fill="var(--ink2)">On a fleet averaging 3 devices per machine, that is ~⅔ of the hardware.</text>
+
+    <line x1="600" y1="30" x2="600" y2="310" stroke="var(--line)"/>
+
+    <!-- RIGHT: deadlock -->
+    <text x="640" y="26" font-size="11.5" font-weight="700" letter-spacing="1.1" fill="var(--fail)">WHY A JOB NEVER HOLDS A PARTIAL SET</text>
+
+    <rect x="640" y="60" width="150" height="46" rx="8" fill="var(--core-bg)" stroke="var(--core-line)"/>
+    <text x="715" y="82" text-anchor="middle" font-size="12.5" font-weight="640" fill="var(--core)">job-A</text>
+    <text x="715" y="98" text-anchor="middle" font-size="10.5" fill="var(--ink2)">needs 2 VGs · holds 1</text>
+
+    <rect x="940" y="60" width="150" height="46" rx="8" fill="var(--panel)" stroke="var(--line)"/>
+    <text x="1015" y="88" text-anchor="middle" font-size="12.5" font-weight="640" fill="var(--ink2)">vg-02</text>
+
+    <rect x="640" y="196" width="150" height="46" rx="8" fill="var(--panel)" stroke="var(--line)"/>
+    <text x="715" y="224" text-anchor="middle" font-size="12.5" font-weight="640" fill="var(--ink2)">vg-01</text>
+
+    <rect x="940" y="196" width="150" height="46" rx="8" fill="var(--warn-bg)" stroke="var(--warn-line)"/>
+    <text x="1015" y="218" text-anchor="middle" font-size="12.5" font-weight="640" fill="var(--warn)">job-B</text>
+    <text x="1015" y="234" text-anchor="middle" font-size="10.5" fill="var(--ink2)">needs 2 VGs · holds 1</text>
+
+    <path d="M794 83 L936 83" stroke="var(--fail)" stroke-width="1.5" fill="none" marker-end="url(#arf4)" stroke-dasharray="5 3"/>
+    <text x="865" y="74" text-anchor="middle" font-size="11" font-weight="640" fill="var(--fail)">waits for</text>
+
+    <path d="M1015 110 L1015 192" stroke="var(--agent)" stroke-width="1.5" fill="none" marker-end="url(#arg4)"/>
+    <text x="1026" y="155" font-size="11" fill="var(--ink2)">held by</text>
+
+    <path d="M936 219 L794 219" stroke="var(--fail)" stroke-width="1.5" fill="none" marker-end="url(#arf4)" stroke-dasharray="5 3"/>
+    <text x="865" y="238" text-anchor="middle" font-size="11" font-weight="640" fill="var(--fail)">waits for</text>
+
+    <path d="M715 192 L715 110" stroke="var(--agent)" stroke-width="1.5" fill="none" marker-end="url(#arg4)"/>
+    <text x="704" y="155" text-anchor="end" font-size="11" fill="var(--ink2)">held by</text>
+
+    <text x="865" y="146" text-anchor="middle" font-size="15" font-weight="700" fill="var(--fail)">DEADLOCK</text>
+    <text x="865" y="164" text-anchor="middle" font-size="11" fill="var(--ink2)">hold-and-wait cycle</text>
+
+    <text x="640" y="278" font-size="12.5" fill="var(--ink2)">Break the cycle by refusing the condition: <tspan font-weight="640" fill="var(--ink)">all N devices in one</tspan></text>
+    <text x="640" y="300" font-size="12.5" font-weight="640" fill="var(--ink)">transaction, or none<tspan font-weight="400" fill="var(--ink2)"> — the database gives you the rollback for free.</tspan></text>
+  </svg>
+  </div>
+
+  <p class="note"><b>Co-location is not what prevents deadlock — all-or-nothing is.</b> Every device is a
+  row in one table in one database, so a claim spanning five benches is the same single local transaction
+  as a claim on one, and equally safe. Cross-bench allocation <em>would</em> work. A job is kept to one
+  bench because the devices are physically cabled to each other, and because a job spanning <i>k</i> benches
+  dies if any of the <i>k</i> dies. Say that precisely: “we avoid deadlock by keeping jobs on one bench” is
+  wrong, and wrong in a way that shows you don't know which mechanism is doing the work.</p>
+
+  <p class="note"><b>Do not accept an “acquire in a loop, release on failure” implementation.</b> It looks
+  equivalent and isn't: if the process dies between acquiring device 2 and failing on device 3, those two
+  devices are locked with no owner and no lease to expire them. A transaction rolls back on crash; hand-rolled
+  cleanup does not.</p>
+
+  <p class="note"><b>The failure mode of all-or-nothing is starvation, not deadlock — and the fix is
+  reservation, which is <em>not</em> a partial hold.</b> A job needing three devices with one free takes
+  <em>nothing</em>. The scheduler simply withholds that free device from other jobs: it stays <code>free</code>
+  in the database with no owner, the job stays <code>QUEUED</code>, and the mark lives in scheduler memory,
+  recomputed every pass. Deadlock needs <em>hold</em>-and-wait; this is wait-without-hold, so no cycle can form.
+  Reservations cover exactly one <em>feasible</em> bench — a machine with two healthy VGs can never satisfy a
+  three-VG job, so reserving there would idle a device forever. And if no bench is feasible at all, the job is
+  flagged <code>no_capable_agent</code> rather than waiting silently, because a scheduler stuck on an impossible
+  job is indistinguishable from a broken one.</p>
+</section>
+
+<!-- ══════════════ 3. CHAOS SEQUENCE ══════════════ -->
+<section>
+  <h2>3 · Chaos: what happens when a bench dies mid-job</h2>
+  <p class="lede">The lease expires on its own — nobody has to <em>detect</em> anything. Every job on that
+  bench comes back, once each. And when the dead agent returns with a result for a job someone else now owns,
+  the epoch fences it out.</p>
+
+  <div class="card">
+  <svg viewBox="0 0 1140 440" role="img" aria-label="Chaos requeue and fencing sequence">
+    <defs>
+      <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--ink3)"/>
+      </marker>
+    </defs>
+
+    <line x1="200" y1="46" x2="1090" y2="46" stroke="var(--line)" stroke-width="1.5"/>
+    <g font-size="12" fill="var(--ink3)" text-anchor="middle" font-weight="600">
+      <text x="270" y="34">t = 0s</text>
+      <text x="440" y="34">t = 3s</text>
+      <text x="620" y="34">t = 12s</text>
+      <text x="800" y="34">t = 14s</text>
+      <text x="990" y="34">t = 40s</text>
+    </g>
+    <g stroke="var(--line)" stroke-width="1" stroke-dasharray="3 4">
+      <line x1="270" y1="46" x2="270" y2="392"/>
+      <line x1="440" y1="46" x2="440" y2="392"/>
+      <line x1="620" y1="46" x2="620" y2="392"/>
+      <line x1="800" y1="46" x2="800" y2="392"/>
+      <line x1="990" y1="46" x2="990" y2="392"/>
+    </g>
+
+    <g font-size="13" font-weight="640">
+      <rect x="20" y="76" width="164" height="48" rx="8" fill="var(--core-bg)" stroke="var(--core-line)"/>
+      <text x="102" y="98" text-anchor="middle" fill="var(--core)">TSS</text>
+      <text x="102" y="115" text-anchor="middle" font-size="11" font-weight="500" fill="var(--ink2)">scheduler + reaper</text>
+
+      <rect x="20" y="176" width="164" height="48" rx="8" fill="var(--agent-bg)" stroke="var(--agent-line)"/>
+      <text x="102" y="196" text-anchor="middle" fill="var(--agent)">agent-7</text>
+      <text x="102" y="213" text-anchor="middle" font-size="11" font-weight="500" fill="var(--ink2)">vg-01 + ag-01</text>
+
+      <rect x="20" y="276" width="164" height="48" rx="8" fill="var(--agent-bg)" stroke="var(--agent-line)"/>
+      <text x="102" y="298" text-anchor="middle" fill="var(--agent)">agent-3</text>
+      <text x="102" y="315" text-anchor="middle" font-size="11" font-weight="500" fill="var(--ink2)">picks up the work</text>
+
+      <rect x="20" y="352" width="164" height="40" rx="8" fill="var(--panel)" stroke="var(--line)"/>
+      <text x="102" y="377" text-anchor="middle" fill="var(--ink2)">job J · epoch</text>
+    </g>
+
+    <g stroke="var(--line)" stroke-width="1.2">
+      <line x1="184" y1="100" x2="1090" y2="100"/>
+      <line x1="184" y1="200" x2="1090" y2="200"/>
+      <line x1="184" y1="300" x2="1090" y2="300"/>
+      <line x1="184" y1="372" x2="1090" y2="372"/>
+    </g>
+
+    <rect x="270" y="186" width="350" height="28" rx="6" fill="var(--agent-bg)" stroke="var(--agent-line)"/>
+    <text x="445" y="205" text-anchor="middle" font-size="12" fill="var(--agent)" font-weight="600">running J on both devices — unaware it is isolated</text>
+    <rect x="620" y="186" width="370" height="28" rx="6" fill="var(--fail-bg)" stroke="var(--fail-line)" stroke-dasharray="4 3"/>
+    <text x="805" y="205" text-anchor="middle" font-size="12" fill="var(--fail)" font-weight="600">no heartbeats reaching TSS</text>
+
+    <rect x="800" y="286" width="290" height="28" rx="6" fill="var(--agent-bg)" stroke="var(--agent-line)"/>
+    <text x="945" y="305" text-anchor="middle" font-size="12" fill="var(--agent)" font-weight="600">running J at epoch 5</text>
+
+    <rect x="270" y="358" width="350" height="28" rx="6" fill="var(--core-bg)" stroke="var(--core-line)"/>
+    <text x="445" y="377" text-anchor="middle" font-size="12" font-weight="700" fill="var(--core)">epoch 4</text>
+    <rect x="620" y="358" width="470" height="28" rx="6" fill="var(--core-bg)" stroke="var(--core-line)"/>
+    <text x="855" y="377" text-anchor="middle" font-size="12" font-weight="700" fill="var(--core)">epoch 5</text>
+
+    <g font-size="11.5">
+      <circle cx="270" cy="100" r="5.5" fill="var(--core)"/>
+      <text x="280" y="76" fill="var(--ink2)">claim vg-01 + ag-01 in ONE transaction · epoch 4</text>
+
+      <circle cx="440" cy="100" r="5.5" fill="var(--fail)"/>
+      <text x="448" y="122" fill="var(--fail)" font-weight="600">network drops</text>
+
+      <circle cx="620" cy="100" r="5.5" fill="var(--warn)"/>
+      <text x="630" y="76" fill="var(--warn)" font-weight="600">presence lease expires — nobody had to detect anything</text>
+
+      <circle cx="800" cy="100" r="5.5" fill="var(--core)"/>
+      <text x="646" y="126" fill="var(--ink2)">reaper: agent-7 OFFLINE · all devices freed · each</text>
+      <text x="646" y="143" fill="var(--ink2)">DISTINCT job requeued once · epoch 5 → agent-3</text>
+
+      <circle cx="990" cy="200" r="5.5" fill="var(--fail)"/>
+      <text x="1080" y="170" text-anchor="end" fill="var(--ink2)">agent-7 returns: “J complete, PASSED” — epoch 4</text>
+    </g>
+
+    <path d="M998 200 L1108 200 L1108 108" stroke="var(--fail)" stroke-width="1.4" marker-end="url(#ar2)" fill="none" stroke-dasharray="4 3"/>
+    <rect x="756" y="228" width="330" height="46" rx="8" fill="var(--fail-bg)" stroke="var(--fail-line)"/>
+    <text x="921" y="248" text-anchor="middle" font-size="12.5" font-weight="700" fill="var(--fail)">409 stale_epoch → abandon_job</text>
+    <text x="921" y="265" text-anchor="middle" font-size="11.5" fill="var(--ink2)">stale result rejected; agent-7 releases its devices locally</text>
+  </svg>
+  </div>
+
+  <p class="note"><b>Two things on this slide win the interview.</b> The first is the epoch: without it,
+  agent-7's stale “PASSED” overwrites a run that is still in flight, and a firmware engineer ships on a result
+  from an abandoned job. The second is the word <b>DISTINCT</b> — a bench running one job across three of its
+  devices appears three times if you iterate resources. Requeue per-device and you bump the epoch three times
+  and burn the job's whole retry budget on a single bench failure. Nothing errors; the job just quietly
+  dead-letters early.</p>
+</section>
+
+<!-- ══════════════ 4. STATE MACHINES ══════════════ -->
+<section>
+  <h2>4 · State machines</h2>
+  <p class="lede">Splitting machine from device gives three small machines instead of one overloaded one.
+  Two transitions carry the customer story: <code>QUARANTINED</code> stops one broken bench from looking like
+  a firmware regression, and <code>INFRA_ERROR</code> stops our hardware failures from being reported as the
+  engineer's bug.</p>
+
+  <div class="card">
+  <svg viewBox="0 0 1140 700" role="img" aria-label="Agent, resource and job state machines">
+    <defs>
+      <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--ink3)"/>
+      </marker>
+      <marker id="arw3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="var(--warn)"/>
+      </marker>
+    </defs>
+
+    <!-- ─── AGENT ─── -->
+    <text x="24" y="24" font-size="11.5" font-weight="700" letter-spacing="1.1" fill="var(--ink3)">AGENT — liveness</text>
+
+    <g font-size="13" font-weight="640" text-anchor="middle">
+      <rect x="180" y="72" width="148" height="46" rx="23" fill="var(--agent-bg)" stroke="var(--agent-line)"/>
+      <text x="254" y="100" fill="var(--agent)">ONLINE</text>
+      <rect x="560" y="72" width="148" height="46" rx="23" fill="var(--fail-bg)" stroke="var(--fail-line)"/>
+      <text x="634" y="100" fill="var(--fail)">OFFLINE</text>
+      <rect x="180" y="176" width="148" height="46" rx="23" fill="var(--panel)" stroke="var(--line)"/>
+      <text x="254" y="204" fill="var(--ink2)">DRAINING</text>
+      <rect x="420" y="176" width="180" height="46" rx="23" fill="var(--warn-bg)" stroke="var(--warn-line)"/>
+      <text x="510" y="204" fill="var(--warn)">QUARANTINED</text>
+    </g>
+
+    <g stroke="var(--ink3)" stroke-width="1.3" fill="none" marker-end="url(#ar3)">
+      <path d="M556 104 L332 104"/>
+      <path d="M254 122 L254 172"/>
+      <path d="M300 122 L424 170"/>
+    </g>
+    <g stroke="var(--warn)" stroke-width="1.4" fill="none" marker-end="url(#arw3)">
+      <path d="M328 87 L556 87"/>
+    </g>
+    <g font-size="11.5" fill="var(--ink2)">
+      <text x="442" y="80" text-anchor="middle" font-weight="600" fill="var(--warn)">presence expires — idle or fully loaded</text>
+      <text x="480" y="122" text-anchor="middle">re-register — its jobs are NOT returned</text>
+      <text x="266" y="152" text-anchor="start">drain requested</text>
+      <text x="436" y="142" text-anchor="start">failures on ≥2 devices</text>
+      <text x="254" y="242" text-anchor="middle" font-size="11" font-style="italic" fill="var(--ink3)">→ OFFLINE when the last job finishes</text>
+      <text x="510" y="242" text-anchor="middle" font-size="11" font-style="italic" fill="var(--ink3)">exits via `tss unquarantine`, or a new agent version</text>
+    </g>
+    <text x="800" y="100" font-size="11.5" fill="var(--ink3)" font-style="italic">No BUSY state —</text>
+    <text x="800" y="117" font-size="11.5" fill="var(--ink3)" font-style="italic">capacity is counted,</text>
+    <text x="800" y="134" font-size="11.5" fill="var(--ink3)" font-style="italic">not flagged.</text>
+
+    <line x1="24" y1="278" x2="1116" y2="278" stroke="var(--line)"/>
+
+    <!-- ─── RESOURCE ─── -->
+    <text x="24" y="308" font-size="11.5" font-weight="700" letter-spacing="1.1" fill="var(--ink3)">RESOURCE — allocation &amp; device health</text>
+
+    <g font-size="13" font-weight="640" text-anchor="middle">
+      <rect x="180" y="342" width="148" height="46" rx="23" fill="var(--agent-bg)" stroke="var(--agent-line)"/>
+      <text x="254" y="370" fill="var(--agent)">FREE</text>
+      <rect x="560" y="342" width="148" height="46" rx="23" fill="var(--core-bg)" stroke="var(--core-line)"/>
+      <text x="634" y="370" fill="var(--core)">BUSY</text>
+      <rect x="170" y="430" width="168" height="46" rx="23" fill="var(--warn-bg)" stroke="var(--warn-line)"/>
+      <text x="254" y="458" fill="var(--warn)">UNHEALTHY</text>
+    </g>
+
+    <g stroke="var(--ink3)" stroke-width="1.3" fill="none" marker-end="url(#ar3)">
+      <path d="M328 357 L556 357"/>
+      <path d="M556 374 L332 374"/>
+      <path d="M228 392 L228 426"/>
+      <path d="M282 426 L282 392"/>
+    </g>
+    <g font-size="11.5" fill="var(--ink2)">
+      <text x="442" y="350" text-anchor="middle" font-weight="600" fill="var(--core)">claimed — all N in one transaction, or none</text>
+      <text x="444" y="392" text-anchor="middle">job done · requeued · owning agent went offline</text>
+      <text x="216" y="413" text-anchor="end">probe fails</text>
+      <text x="294" y="413" text-anchor="start">probe passes</text>
+    </g>
+    <text x="800" y="368" font-size="11.5" fill="var(--ink3)" font-style="italic">One dead J-Link costs you one device,</text>
+    <text x="800" y="385" font-size="11.5" fill="var(--ink3)" font-style="italic">not the whole bench. Failures on ONE</text>
+    <text x="800" y="402" font-size="11.5" fill="var(--ink3)" font-style="italic">device → quarantine the device; failures</text>
+    <text x="800" y="419" font-size="11.5" fill="var(--ink3)" font-style="italic">across SEVERAL → quarantine the machine.</text>
+
+    <line x1="24" y1="512" x2="1116" y2="512" stroke="var(--line)"/>
+
+    <!-- ─── JOB ─── -->
+    <text x="24" y="536" font-size="11.5" font-weight="700" letter-spacing="1.1" fill="var(--ink3)">JOB</text>
+
+    <g font-size="12.5" font-weight="640" text-anchor="middle">
+      <rect x="40" y="600" width="118" height="44" rx="22" fill="var(--panel)" stroke="var(--line)"/>
+      <text x="99" y="627" fill="var(--ink2)">QUEUED</text>
+      <rect x="212" y="600" width="124" height="44" rx="22" fill="var(--core-bg)" stroke="var(--core-line)"/>
+      <text x="274" y="627" fill="var(--core)">ASSIGNED</text>
+      <rect x="390" y="600" width="118" height="44" rx="22" fill="var(--core-bg)" stroke="var(--core-line)"/>
+      <text x="449" y="627" fill="var(--core)">RUNNING</text>
+      <rect x="592" y="556" width="124" height="40" rx="20" fill="var(--agent-bg)" stroke="var(--agent-line)"/>
+      <text x="654" y="581" fill="var(--agent)">PASSED</text>
+      <rect x="592" y="602" width="124" height="40" rx="20" fill="var(--fail-bg)" stroke="var(--fail-line)"/>
+      <text x="654" y="627" fill="var(--fail)">FAILED</text>
+      <rect x="592" y="648" width="152" height="40" rx="20" fill="var(--warn-bg)" stroke="var(--warn-line)"/>
+      <text x="668" y="673" fill="var(--warn)">INFRA_ERROR</text>
+      <rect x="876" y="602" width="152" height="40" rx="20" fill="var(--panel)" stroke="var(--line)"/>
+      <text x="952" y="627" fill="var(--ink2)">DEAD_LETTER</text>
+    </g>
+
+    <g stroke="var(--ink3)" stroke-width="1.3" fill="none" marker-end="url(#ar3)">
+      <path d="M158 622 L208 622"/>
+      <path d="M336 622 L386 622"/>
+      <path d="M508 612 L588 584"/>
+      <path d="M508 622 L588 622"/>
+      <path d="M478 648 C500 672, 540 668, 588 668"/>
+      <path d="M449 596 C449 564, 99 564, 99 596"/>
+      <path d="M744 666 C820 666, 856 648, 878 640"/>
+    </g>
+    <g font-size="11.5" fill="var(--ink2)">
+      <text x="183" y="614" text-anchor="middle">all-or-</text>
+      <text x="183" y="640" text-anchor="middle">nothing</text>
+      <text x="361" y="614" text-anchor="middle">agent</text>
+      <text x="361" y="640" text-anchor="middle">starts</text>
+      <text x="290" y="558" text-anchor="middle">presence expired or infra error · requeue · epoch++ — while fewer than 3 distinct benches tried</text>
+      <text x="524" y="578" text-anchor="middle" font-size="11">firmware ok</text>
+      <text x="730" y="606" text-anchor="start" font-size="11" fill="var(--ink3)">terminal — a real</text>
+      <text x="730" y="621" text-anchor="start" font-size="11" fill="var(--ink3)">result, never</text>
+      <text x="730" y="636" text-anchor="start" font-size="11" fill="var(--ink3)">auto-retried</text>
+      <text x="548" y="700" text-anchor="middle" font-size="11">bench or device died — our fault, not the engineer's</text>
+      <text x="952" y="666" text-anchor="middle" font-size="11">attempts exhausted: failed</text>
+      <text x="952" y="681" text-anchor="middle" font-size="11">on 3 distinct benches</text>
+    </g>
+  </svg>
+  </div>
+
+  <p class="note"><b>FAILED vs INFRA_ERROR is a one-line schema decision that determines whether anyone trusts
+  the system.</b> Conflate them and engineers learn “the rig is flaky, just re-run it” — and then real
+  regressions get re-run away. Separate them and a failed job means something.</p>
+</section>
+
+<footer>
+  TSS architecture · designed for the Samsara Automation exercise · companion to <code>TSS-Architecture.md</code>
+</footer>
+
+</div>
+</body>
+</html>

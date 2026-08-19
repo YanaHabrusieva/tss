@@ -2,6 +2,10 @@
 name = "tss"
 version = "0.1.0"
 description = "Test Scheduling Service — a job broker for hardware-in-the-loop test fleets"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "YanaHabrusieva" }]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",

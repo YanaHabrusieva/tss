@@ -9,6 +9,14 @@ on:
     branches: [main]
   pull_request:
 
+# A superseded run proves nothing about the commit that superseded it, and on a
+# gate that costs minutes of chaos it is minutes spent on a tree nobody will
+# merge. In-progress runs for the same ref are cancelled when a new one starts —
+# except on main, where every commit's result is a record worth keeping.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -17,6 +25,11 @@ jobs:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v6
         with:
+          # Pinned rather than inherited from the runner image: `requires-python`
+          # is >=3.12, so an image bump could silently move the gate to a version
+          # nobody chose, and "it passed on whatever GitHub had that week" is not
+          # a result you can defend.
+          python-version: "3.12"
           # Without this the cache key never changes and the cache is never
           # invalidated; with it, a dependency bump is a cache miss, which is
           # what a cache key is for.

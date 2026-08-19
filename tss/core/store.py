@@ -965,6 +965,30 @@ class Store:
                 detail={"reported_while_busy": True},
             )
 
+    @staticmethod
+    def _clear_device_failure_counts(conn: sqlite3.Connection, agent_id: str) -> None:
+        """End the bench's failure streak on its devices as well as on the bench.
+
+        `resources.consecutive_fails` exists for ONE purpose: to attribute the
+        agent's current streak when it crosses the threshold — the SPREAD is what
+        decides device-blame or machine-blame. So the moment that streak ends,
+        every device's contribution to it ends too. It did not, and the result was
+        a closed incident convicting a healthy machine weeks later: one device
+        failed once, a pass on another device broke the streak and reset the
+        bench, and the stale 1 sat there until the next incident, where three
+        errors clustered on ONE device were reported as "across 2 device(s)" and
+        the machine went out while the faulty device kept taking work.
+
+        A device already under quarantine keeps its count. That number belongs to
+        its own verdict, is displayed beside it, and is cleared by un-quarantining
+        that device.
+        """
+        conn.execute(
+            """UPDATE resources SET consecutive_fails = 0
+                WHERE agent_id = ? AND quarantined_at IS NULL""",
+            (agent_id,),
+        )
+
     def _attribute_failure(
         self,
         conn: sqlite3.Connection,
@@ -985,13 +1009,12 @@ class Store:
         A pass clears the slate: `consecutive_fails` means consecutive.
         """
         if outcome not in (Outcome.INFRA_ERROR, Outcome.FAILED):
-            # A pass clears the slate: `consecutive_fails` means consecutive.
-            placeholders = ",".join("?" * len(resource_ids))
-            conn.execute(
-                f"UPDATE resources SET consecutive_fails = 0 WHERE id IN ({placeholders})",
-                tuple(resource_ids),
-            )
+            # A pass clears the slate: `consecutive_fails` means consecutive, and
+            # the slate is the BENCH's, not this job's. Clearing only the devices
+            # this job happened to use left every other device's count standing
+            # after the streak that produced it had already ended.
             conn.execute("UPDATE agents SET consecutive_fails = 0 WHERE id = ?", (agent_id,))
+            self._clear_device_failure_counts(conn, agent_id)
             return
         if outcome is Outcome.FAILED:
             # The firmware misbehaved. That is the engineer's problem and says
@@ -1023,7 +1046,10 @@ class Store:
                 (agent_id,),
             )
         ]
-        # Blame assigned; the count starts again from here either way.
+        # Blame assigned; the count starts again from here either way. The
+        # devices' counts go too, at the end of each branch below — after the
+        # quarantine writes, so a device that was just condemned keeps the number
+        # its verdict was based on.
         conn.execute("UPDATE agents SET consecutive_fails = 0 WHERE id = ?", (agent_id,))
 
         if len(implicated) >= 2:
@@ -1043,6 +1069,7 @@ class Store:
             # a bench that is still draining — the log has to be able to explain
             # the state, and here it would contradict it.
             if quarantined.rowcount != 1:
+                self._clear_device_failure_counts(conn, agent_id)
                 return
             self._insert_event(
                 conn,
@@ -1051,6 +1078,7 @@ class Store:
                 agent_id=agent_id,
                 detail={"consecutive_fails": threshold, "devices": implicated},
             )
+            self._clear_device_failure_counts(conn, agent_id)
             return
 
         for resource_id in implicated:
@@ -1069,6 +1097,10 @@ class Store:
                 resource_id=resource_id,
                 detail={"consecutive_fails": threshold},
             )
+        # After the writes above, so a device just condemned keeps the number its
+        # verdict was based on — `quarantined_at` is now set on it, and the clear
+        # skips exactly those.
+        self._clear_device_failure_counts(conn, agent_id)
 
     def _diagnose_fence(self, job_id: str, agent_id: str, epoch: int) -> str:
         """Why a fenced write matched nothing. Everything here means the same
@@ -1373,6 +1405,15 @@ class Store:
         feature, which is why this exists at all. Clearing the failure count is
         the point: the bench starts again from zero rather than being one bad job
         away from going straight back out.
+
+        ITS DEVICES' COUNTS GO TOO. Letting a machine back in while its devices
+        still carry blame from before it went out is the same staleness one level
+        down — the bench returns at zero and the very next failure anywhere on it
+        is judged against evidence from a closed incident.
+
+        Only the COUNTS. A device TSS quarantined on its own evidence keeps its
+        state and its `quarantined_at`: that is a separate verdict about a
+        separate thing, and it is cleared by un-quarantining that device.
         """
         now = time.time() if now is None else now
         agent = self.get_agent(agent_id)
@@ -1388,6 +1429,7 @@ class Store:
         )
         if cur.rowcount != 1:
             return "unknown_agent"
+        self._clear_device_failure_counts(self.conn, agent_id)
         self.append_event(
             "agent.unquarantined", agent_id=agent_id, detail={"was": str(agent.state)}, now=now
         )

@@ -27,11 +27,19 @@ import contextlib
 import logging
 import time
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from tss.core import matcher
 from tss.core.config import DEFAULT, Config
-from tss.core.models import Assignment, ClaimResult, Job, Resource, ResourceState
+from tss.core.models import (
+    Assignment,
+    CapabilitySpec,
+    ClaimResult,
+    Job,
+    Resource,
+    ResourceState,
+)
 from tss.core.store import BLOCKED_NO_CAPABLE_AGENT, Store
 
 log = logging.getLogger("tss.scheduler")
@@ -271,6 +279,31 @@ class Scheduler:
     def _clear_unsatisfiable(self, job: Job) -> None:
         if job.blocked_reason == BLOCKED_NO_CAPABLE_AGENT:
             self.store.set_blocked_reason(job.id, None)
+
+    def feasible_agents(
+        self, requirements: Sequence[CapabilitySpec], *, now: float | None = None
+    ) -> list[str]:
+        """Benches that could EVER satisfy these requirements, free or not.
+
+        STEP 1 OF §3.4.1, EXPOSED. This is the same filter a reservation is
+        scoped by and the same one that decides a job is unsatisfiable; the
+        submit path asks it at the door so the caller is told at once instead of
+        discovering it when the starvation threshold eventually flags the job.
+        Deliberately not a second implementation of the matching semantics — one
+        `could_ever_satisfy` per bench, exactly as `_recompute_reservation` does
+        it, or the answer at the door and the answer in the queue would drift.
+        """
+        now = time.time() if now is None else now
+        online = {agent.id for agent in self.store.online_agents(now=now)}
+        installed_by_agent: dict[str, list[Resource]] = defaultdict(list)
+        for resource in self.store.list_resources():
+            if resource.agent_id in online:
+                installed_by_agent[resource.agent_id].append(resource)
+        return sorted(
+            agent_id
+            for agent_id, pool in installed_by_agent.items()
+            if matcher.could_ever_satisfy(requirements, pool)
+        )
 
     def reservation_for(self, job_id: str) -> Reservation | None:
         reservation = self.reservation

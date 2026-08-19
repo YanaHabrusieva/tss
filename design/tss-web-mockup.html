@@ -49,7 +49,7 @@
   .beat{font-size:11.5px;color:var(--faint);margin-left:auto}
   .load{font-size:11.5px;color:var(--muted)}
   .chip{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.05em;border-radius:5px;
-        padding:2px 8px;border:1px solid}
+        padding:2px 8px;border:1px solid;text-transform:uppercase}
   .c-ok{color:var(--ok);background:var(--ok-bg);border-color:#2A5943}
   .c-busy{color:var(--busy);background:var(--busy-bg);border-color:#33477A}
   .c-warn{color:var(--warn);background:var(--warn-bg);border-color:#5E4A1A}
@@ -101,13 +101,11 @@
   .k.ok{color:var(--ok)} .k.busy{color:var(--busy)} .k.warn{color:var(--warn)} .k.bad{color:var(--bad)} .k.mut{color:var(--muted)}
   .ev .d{color:var(--muted)} .ev .d b{color:var(--ink);font-weight:600}
 
-  /* ── state key ── */
-  .legend{margin:0 26px;max-width:1508px;background:var(--panel);border:1px solid var(--lineS);
-          border-radius:12px;padding:12px 16px}
-  .lrow{display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:4px 0;font-size:12px}
-  .lcap{width:56px;color:var(--faint);font-size:10.5px;text-transform:uppercase;
-        letter-spacing:.08em;font-weight:700}
-  .lhint{color:var(--faint);font-size:11px;margin-right:8px}
+  /* ── state key: three frames — Bench, Device, Job ── */
+  .legend{margin:0 26px;max-width:1508px;display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .lgroup{background:var(--panel);border:1px solid var(--lineS);border-radius:12px;padding:12px 16px}
+  .litem{display:flex;align-items:baseline;gap:8px;padding:3px 0}
+  .lhint{color:var(--faint);font-size:11px}
   .c-mut{color:var(--muted);background:var(--panel2);border-color:var(--lineS)}
 
   footer{padding:10px 26px 20px;font-size:11.5px;color:var(--faint)}
@@ -142,7 +140,7 @@
         <div class="dev busy"><span class="id mono">vg-01</span><span class="cap">vehicle_gateway</span>
           <span class="st busy">BUSY · smoke-1 <span class="jid mono">(2bb76)</span></span></div>
         <div class="dev resv"><span class="id mono">vg-02</span><span class="cap">vehicle_gateway</span>
-          <span class="st resv">free · RESERVED for gw2gw</span></div>
+          <span class="st resv">FREE · RESERVED for gateway-pair</span></div>
       </div>
 
       <div class="bench">
@@ -155,7 +153,7 @@
         <div class="dev busy"><span class="id mono">ag-01</span><span class="cap">asset_gateway</span>
           <span class="st busy">BUSY · smoke-2 <span class="jid mono">(9d1f2)</span></span></div>
         <div class="dev free"><span class="id mono">ag-02</span><span class="cap">asset_gateway</span>
-          <span class="st free">free</span></div>
+          <span class="st free">FREE</span></div>
         <div class="dev quar"><span class="id mono">ag-03</span><span class="cap">asset_gateway</span>
           <span class="st quar">QUARANTINED · 3 infra errors</span></div>
       </div>
@@ -168,9 +166,9 @@
         </div>
         <div class="load">—</div>
         <div class="dev gone"><span class="id mono">vg-01</span><span class="cap">vehicle_gateway</span>
-          <span class="st gone">freed</span></div>
+          <span class="st gone">FREED</span></div>
         <div class="dev gone"><span class="id mono">vg-02</span><span class="cap">vehicle_gateway</span>
-          <span class="st gone">freed</span></div>
+          <span class="st gone">FREED</span></div>
         <div class="offnote">presence expired — 1 job requeued</div>
       </div>
     </div>
@@ -192,14 +190,14 @@
       <div class="jcard">
         <h2>Queued · 2</h2>
         <div class="jrow">
-          <div class="jname">gw2gw <span class="jid mono">(067fe)</span></div>
+          <div class="jname">gateway-pair <span class="jid mono">(067fe)</span></div>
           <div class="jmeta">needs <b>2 × vehicle_gateway</b>, all on one bench · waited 35s</div>
           <div class="why">RESERVING on bench-sf-01 — vg-02 held for this job; waiting on vg-01 to free</div>
         </div>
         <div class="jrow">
           <div class="jname">regression1 <span class="jid mono">(a1b2c)</span></div>
           <div class="jmeta">needs <b>1 × vehicle_gateway</b> · requeued from bench-sf-02</div>
-          <div class="why wait">waiting — no free vehicle_gateway (vg-02 is reserved by gw2gw)</div>
+          <div class="why wait">waiting — no free vehicle_gateway (vg-02 is reserved by gateway-pair)</div>
         </div>
       </div>
     </div>
@@ -231,29 +229,32 @@
 </main>
 
 <section class="legend">
-  <div class="lrow"><span class="lcap">bench</span>
-    <span class="chip c-ok">ONLINE</span>
-    <span class="chip c-warn">DRAINING</span><span class="lhint">finishing its jobs, taking nothing new</span>
-    <span class="chip c-bad">OFFLINE</span><span class="lhint">not heartbeating — may come back by itself</span>
-    <span class="chip c-bad">QUARANTINED</span><span class="lhint">TSS refuses it — cleared by an operator or a new agent version</span>
+  <div class="lgroup">
+    <h2>Bench</h2>
+    <div class="litem"><span class="chip c-ok">ONLINE</span></div>
+    <div class="litem"><span class="chip c-warn">DRAINING</span><span class="lhint">finishing its jobs, taking nothing new</span></div>
+    <div class="litem"><span class="chip c-bad">OFFLINE</span><span class="lhint">not heartbeating — may come back by itself</span></div>
+    <div class="litem"><span class="chip c-bad">QUARANTINED</span><span class="lhint">TSS refuses it — cleared by an operator or a new agent version</span></div>
   </div>
-  <div class="lrow"><span class="lcap">device</span>
-    <span class="chip c-ok">free</span>
-    <span class="chip c-busy">BUSY</span>
-    <span class="chip c-warn">RESERVED</span><span class="lhint">still free — held for a waiting job</span>
-    <span class="chip c-warn">unhealthy</span><span class="lhint">the bench's own report, withdrawable</span>
-    <span class="chip c-bad">QUARANTINED</span><span class="lhint">TSS's verdict — 3 infra errors in a row</span>
-    <span class="chip c-mut">freed</span><span class="lhint">bench offline</span>
-    <span class="chip c-mut">retired</span><span class="lhint">gone from inventory</span>
+  <div class="lgroup">
+    <h2>Device</h2>
+    <div class="litem"><span class="chip c-ok">FREE</span></div>
+    <div class="litem"><span class="chip c-busy">BUSY</span></div>
+    <div class="litem"><span class="chip c-warn">RESERVED</span><span class="lhint">still free — held for a waiting job</span></div>
+    <div class="litem"><span class="chip c-warn">UNHEALTHY</span><span class="lhint">the bench's own report, withdrawable</span></div>
+    <div class="litem"><span class="chip c-bad">QUARANTINED</span><span class="lhint">TSS's verdict — 3 infra errors in a row</span></div>
+    <div class="litem"><span class="chip c-mut">FREED</span><span class="lhint">released because its bench went offline</span></div>
+    <div class="litem"><span class="chip c-mut">RETIRED</span><span class="lhint">gone from inventory</span></div>
   </div>
-  <div class="lrow"><span class="lcap">job</span>
-    <span class="chip c-mut">queued</span>
-    <span class="chip c-busy">running</span>
-    <span class="chip c-ok">passed</span>
-    <span class="chip c-warn">infra_error</span><span class="lhint">environment's fault — retried elsewhere</span>
-    <span class="chip c-bad">failed</span><span class="lhint">a real result — never auto-retried</span>
-    <span class="chip c-bad">dead_letter</span><span class="lhint">gave up after repeated infra errors</span>
-    <span class="chip c-mut">cancelled</span>
+  <div class="lgroup">
+    <h2>Job</h2>
+    <div class="litem"><span class="chip c-mut">QUEUED</span></div>
+    <div class="litem"><span class="chip c-busy">RUNNING</span></div>
+    <div class="litem"><span class="chip c-ok">PASSED</span></div>
+    <div class="litem"><span class="chip c-warn">INFRA ERROR</span><span class="lhint">environment's fault — retried elsewhere</span></div>
+    <div class="litem"><span class="chip c-bad">FAILED</span><span class="lhint">a real result — never auto-retried</span></div>
+    <div class="litem"><span class="chip c-bad">GAVE UP</span><span class="lhint">stopped retrying after repeated infra errors · dead_letter in the API</span></div>
+    <div class="litem"><span class="chip c-mut">CANCELLED</span></div>
   </div>
 </section>
 

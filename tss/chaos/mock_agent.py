@@ -143,6 +143,19 @@ class MockAgent(TestbedAgent):
         path = response.request.url.path
         if response.status_code == 409 and path.endswith("/complete"):
             self.fenced_reports += 1
+            # THE ZOMBIE DEMO'S MONEY MOMENT, and until now a single INFO line in
+            # a stream of them. This is the instant a partitioned bench's result
+            # for a run TSS already gave away is refused — the whole reason the
+            # epoch exists — so in verbose mode it gets a line nobody can miss.
+            log.warning(
+                "\n%s\n  FENCED: %s reported a result for %s and was REFUSED "
+                "(stale epoch)\n  a partitioned bench came back and TSS did not "
+                "believe it\n%s",
+                "=" * 78,
+                self.agent_id,
+                path.rsplit("/", 2)[-2],
+                "=" * 78,
+            )
         if not self.profile.deaf_probability:
             return
         # /start ONLY, and that is the whole point rather than a simplification.

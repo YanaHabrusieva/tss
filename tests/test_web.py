@@ -97,9 +97,59 @@ def test_a_reconnect_throws_the_old_view_away(page):
 
 def test_every_state_is_a_word_not_just_a_colour(page):
     """Projector colour is unreliable and part of the audience will not see it
-    at all. Colour reinforces; the word carries."""
-    for word in ("ONLINE", "DRAINING", "OFFLINE", "QUARANTINED", "RESERVED", "freed", "retired"):
+    at all. Colour reinforces; the word carries — and every state word is
+    uppercase, so a state never reads like prose."""
+    for word in (
+        "ONLINE",
+        "DRAINING",
+        "OFFLINE",
+        "QUARANTINED",
+        "RESERVED",
+        "FREED",
+        "RETIRED",
+        "FREE",
+        "BUSY",
+        "UNHEALTHY",
+        "GAVE UP",
+        "INFRA ERROR",
+    ):
         assert word in page, f"{word} is not spelled out anywhere"
+
+
+def test_a_job_name_is_never_uppercased(page):
+    """The reason the uppercasing is per-word rather than a text-transform on the
+    rows: those rows hold job names too. `BUSY · smoke-1` must never become
+    `BUSY · SMOKE-1` — a name is what the engineer typed."""
+    assert "function stateWord(" in page, "state words must be uppercased in code, per word"
+    for selector in (".st{", ".jname{", ".dev{", ".ev{", ".jmeta{"):
+        start = page.index(selector)
+        block = page[start : page.index("}", start)]
+        assert "text-transform" not in block, (
+            f"{selector} uppercases a whole container, which would rewrite job names"
+        )
+
+
+def test_dead_letter_reads_as_gave_up_on_screen_only(page):
+    """The state is `dead_letter` everywhere a machine reads it and GAVE UP where
+    a person does — and the legend carries the mapping so nobody has to guess."""
+    assert '"GAVE UP"' in page, "the display label must exist"
+    assert "dead_letter in the API" in page, "the legend must name the real state"
+    assert "dead_letter:" in page, "the mapping must key off the real state name"
+
+
+def test_the_state_key_is_three_frames(page):
+    """Bench, Device, Job — as in the design target."""
+    assert page.count('class="lgroup"') == 3
+    for title in ("<h2>Bench</h2>", "<h2>Device</h2>", "<h2>Job</h2>"):
+        assert title in page
+
+
+def test_the_empty_state_says_only_what_is_true(page):
+    """It used to suggest a command. The page is read-only and the command it
+    named was wrong for half the ways a fleet gets started."""
+    assert "no benches registered</div>" in page
+    assert "just add bench" not in page
+    assert "just agent bench" not in page
 
 
 def test_values_from_the_fleet_are_escaped_before_they_reach_the_dom(page):

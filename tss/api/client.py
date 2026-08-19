@@ -15,6 +15,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
+from starlette.requests import HTTPConnection
 
 from tss.api.deps import get_config, get_directives, get_scheduler, get_store
 from tss.core import matcher
@@ -109,6 +110,33 @@ class SubmitRequest(BaseModel):
 class SubmitResponse(BaseModel):
     job_id: str
     queue_position: int
+    #: Could ANY bench in the fleet ever run this, free or not? Additive, and
+    #: advisory: an infeasible job is still queued, because fleets change and a
+    #: job that cannot run on today's fleet may run on tomorrow's (§3.4.1). What
+    #: was missing was telling the submitter AT THE DOOR — until now they found
+    #: out when the starvation threshold eventually flagged it, or never.
+    feasible: bool = True
+    #: Filled in only when `feasible` is false: what the fleet does not have, in
+    #: words, so the wrapper can print something actionable.
+    infeasible_reason: str | None = None
+
+
+def _needs_phrase(requirements: list[CapabilitySpec]) -> str:
+    """`vehicle_gateway + asset_gateway` — the specs as a person would say them."""
+    parts = []
+    for spec in requirements:
+        product = spec.get("product")
+        extra = ",".join(f"{k}={v}" for k, v in sorted(spec.items()) if k != "product")
+        parts.append(f"{product}({extra})" if product and extra else str(product or extra))
+    return " + ".join(parts)
+
+
+def _infeasible_reason(store: Store, requirements: list[CapabilitySpec]) -> str:
+    needs = _needs_phrase(requirements)
+    if not store.agents():
+        return f"no benches are registered at all (needs {needs})"
+    where = " on ONE bench" if len(requirements) > 1 else ""
+    return f"no bench in the fleet can satisfy this (needs {needs}{where})"
 
 
 class ReservationView(BaseModel):
@@ -175,9 +203,18 @@ async def submit_job(
         )
 
     job_id = _submit_with_a_unique_id(store, req)
+    # Assessed with the SCHEDULER's own step-1 filter, not a second copy of the
+    # matching semantics: the answer at the door has to be the answer the queue
+    # will give, or this is just a different opinion delivered sooner.
+    feasible = bool(scheduler.feasible_agents(req.requirements))
     # Wake the scheduler now rather than waiting for the backstop tick.
     scheduler.notify()
-    return SubmitResponse(job_id=job_id, queue_position=store.queue_position(job_id))
+    return SubmitResponse(
+        job_id=job_id,
+        queue_position=store.queue_position(job_id),
+        feasible=feasible,
+        infeasible_reason=None if feasible else _infeasible_reason(store, req.requirements),
+    )
 
 
 #: Hex characters of randomness in a job id. Eight — 32 bits — gives even odds
@@ -214,6 +251,95 @@ def _submit_with_a_unique_id(store: Store, req: SubmitRequest) -> str:
             continue
         return job_id
     raise AssertionError("unreachable")  # pragma: no cover
+
+
+class StatsView(BaseModel):
+    """What the fleet is doing, in numbers (§3.9).
+
+    READ-ONLY AND DERIVED. Every figure here is counted out of tables that were
+    already being written — no counter is incremented on the claim path, the
+    heartbeat path or the completion path to make this endpoint cheaper, because
+    a statistic that slows down dispatch is a bad trade and a statistic that can
+    drift from the rows it summarises is worse.
+    """
+
+    now: float
+    uptime_s: float
+    #: Devices by state, and the one number an operator actually wants: what
+    #: fraction of the fleet's usable hardware is doing work right now.
+    devices: dict[str, int] = Field(default_factory=dict)
+    utilization: float = 0.0
+    jobs: dict[str, int] = Field(default_factory=dict)
+    #: Terminal jobs in the recent window, by outcome, plus the window itself —
+    #: a rate with no window attached is a number nobody can check.
+    window_s: float = 0.0
+    completed_in_window: dict[str, int] = Field(default_factory=dict)
+    throughput_per_min: float = 0.0
+    #: Recovery work, not failures: how often TSS took a job back.
+    requeues_in_window: int = 0
+    quarantined_agents: list[str] = Field(default_factory=list)
+    quarantined_devices: list[str] = Field(default_factory=list)
+    #: Events the live bus could not hand to a slow subscriber. Non-zero means
+    #: the WS view and `tss watch` have gaps the audit log does not.
+    event_bus_drops: int = 0
+
+
+#: The throughput window. Long enough that a fleet running minute-long jobs has
+#: something to average, short enough to still be about now.
+STATS_WINDOW_S = 300.0
+
+
+@router.get("/stats", response_model=StatsView)
+async def stats(connection: HTTPConnection, store: StoreDep) -> StatsView:
+    now = time.time()
+    since = now - STATS_WINDOW_S
+
+    devices: dict[str, int] = {}
+    quarantined_devices = []
+    for resource in store.list_resources():
+        devices[str(resource.state)] = devices.get(str(resource.state), 0) + 1
+        if resource.quarantined_at is not None:
+            quarantined_devices.append(resource.id)
+    # Retired devices are not capacity, so they are not in the denominator —
+    # the same call the fleet view makes about `busy/total` (§3.9).
+    usable = sum(count for state, count in devices.items() if state != "retired")
+    busy = devices.get("busy", 0)
+
+    jobs = {
+        row["state"]: row["n"]
+        for row in store.conn.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state")
+    }
+    completed = {
+        row["outcome"]: row["n"]
+        for row in store.conn.execute(
+            "SELECT outcome, COUNT(*) AS n FROM jobs "
+            "WHERE finished_at IS NOT NULL AND finished_at >= ? AND outcome IS NOT NULL "
+            "GROUP BY outcome",
+            (since,),
+        )
+    }
+    requeues = store.conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE kind = 'job.requeued' AND ts >= ?", (since,)
+    ).fetchone()["n"]
+
+    bus = getattr(connection.app.state, "bus", None)
+    started_at = getattr(connection.app.state, "started_at", now)
+    return StatsView(
+        now=now,
+        uptime_s=max(0.0, now - started_at),
+        devices=devices,
+        utilization=round(busy / usable, 4) if usable else 0.0,
+        jobs=jobs,
+        window_s=STATS_WINDOW_S,
+        completed_in_window=completed,
+        throughput_per_min=round(sum(completed.values()) / (STATS_WINDOW_S / 60.0), 3),
+        requeues_in_window=requeues,
+        quarantined_agents=sorted(
+            a.id for a in store.agents() if a.state == AgentState.QUARANTINED
+        ),
+        quarantined_devices=sorted(quarantined_devices),
+        event_bus_drops=getattr(bus, "dropped", 0),
+    )
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatus)

@@ -7,6 +7,7 @@ one config, and one reaper for the process, and to start and stop them.
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -54,6 +55,10 @@ def create_app(config: Config | None = None, store: Store | None = None) -> Fast
             store.close()
 
     app = FastAPI(title="TSS", version="0.1.0", lifespan=lifespan)
+    # Wall-clock, like every other persisted or reported timestamp (§3.3):
+    # `monotonic` measures durations inside one process and would report an
+    # uptime that means nothing next to the event timestamps beside it.
+    app.state.started_at = time.time()
     app.state.store = store
     app.state.config = config
     app.state.scheduler = scheduler

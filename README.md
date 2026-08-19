@@ -96,13 +96,29 @@ in `.demo-logs/NAME.log` so the terminal stays readable.
 **Then submit work and watch it.**
 
 ```bash
-just submit smoke                     # one device
-just submit gateway-to-gateway 2      # TWO devices, both on ONE bench
+just submit smoke 1 0                 # one vehicle gateway
+just submit gateway-to-gateway 2 0    # TWO vehicle gateways, both on ONE bench
+just submit mixed 1 1                 # one of each — needs a bench that has both
 just fleet                            # benches with their devices
 just queue                            # what is running, what is waiting
 just watch                            # the live view — this is the one to have on screen
 just why smoke                        # why is that job not running yet?
 ```
+
+`just submit NAME VG AG DURATION` takes its counts in the same order as `just add NAME VG AG`:
+a name, vehicle gateways, asset gateways, then how long. If no bench in the fleet could ever run
+what you asked for, it says so at once rather than leaving you to find out from `tss why`:
+
+```
+mixed-test (a3f91) queued — WARNING: no bench in the fleet can satisfy this
+(needs vehicle_gateway + asset_gateway on ONE bench)
+It will wait for the fleet to change, and dead-letters if none appears in time.
+```
+
+The job is still queued — that is deliberate, because fleets get repaired and extended
+(`TSS-Architecture.md` §3.4.1). `just submit-bad NAME VG AG DURATION` is the same thing with a
+payload that reports `infra_error`: a chaos control, kept as a separate verb because a customer does
+not get to declare their own job's outcome.
 
 The service also serves the live fleet view at **<http://127.0.0.1:8000/>** — the same feed `tss
 watch` renders, in a browser: one self-contained page, pushed over `WS /v1/events`, never polled. It
@@ -112,7 +128,7 @@ Jobs read as `smoke-1 (2bb76)` on every human surface — the name you chose, pl
 tell three `smoke` jobs apart. The full `job-2bb76a1c` stays on the wire and in the logs; `tss why`
 and `tss cancel` accept either that or the short id or the name you can see on screen.
 
-`just submit NAME DEVICES DURATION` is a convenience wrapper. The API underneath is plain HTTP:
+The API underneath the wrapper is plain HTTP:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/jobs -H 'content-type: application/json' -d '{
@@ -184,12 +200,12 @@ just agent bench-sf-01 2                                                       #
 Then, in a fourth:
 
 ```bash
-just submit soak 1 90     # takes one of bench-sf-01's two vehicle gateways
-just submit gw2gw 2       # needs TWO vehicle gateways on one bench: nowhere to fit
+just submit soak 1 0 90     # takes one of bench-sf-01's two vehicle gateways
+just submit gw2gw 2 0       # needs TWO vehicle gateways on one bench: nowhere to fit
 sleep 6
-just queue                # -> gw2gw: RESERVING on bench-sf-01 (vg-02 held)
-just submit smoke 1 20    # another vehicle-gateway job — it does NOT take the reserved device
-just fleet                # -> bench-sf-01 vg-02 still free, and still nobody's
+just queue                  # -> gw2gw: RESERVING on bench-sf-01 (vg-02 held)
+just submit smoke 1 0 20    # another vehicle-gateway job — it does NOT take the reserved device
+just fleet                  # -> bench-sf-01 vg-02 still free, and still nobody's
 ```
 
 ```
@@ -269,7 +285,7 @@ CI runs lint, the suite, and the chaos gate on every push
 | | |
 |---|---|
 | `tss/core/` | store (all writes, the N-way claim), matcher, scheduler, reaper, events, invariants |
-| `tss/api/` | `/v1/agents/*` for benches, `/v1/jobs`, `/v1/fleet`, `/v1/queue` for humans, `WS /v1/events`, and `/` — the web view, one file in `api/static/` |
+| `tss/api/` | `/v1/agents/*` for benches, `/v1/jobs`, `/v1/fleet`, `/v1/queue`, `/v1/stats` for humans, `WS /v1/events`, and `/` — the web view, one file in `api/static/` |
 | `tss/agent/` | the daemon that runs on a bench: register, heartbeat, run, report |
 | `tss/chaos/` | mock benches with failure profiles, the seeded runner, the ground-truth checker |
 | `tss/cli/` | `tss fleet | queue | watch | why` |

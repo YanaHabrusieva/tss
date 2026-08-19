@@ -126,9 +126,14 @@ watch:
 why JOB:
     @{{py}} -m tss.cli.main why {{JOB}}
 
-# Submit a job: `just submit smoke` or `just submit gw2gw 2`.
-submit NAME="smoke" DEVICES="1" DURATION="10":
-    @{{py}} -c "import json,sys,urllib.request as u;         reqs=[{'product':'vehicle_gateway'}]*int('{{DEVICES}}');         body=json.dumps({'name':'{{NAME}}','requirements':reqs,'payload':{'duration_s':float('{{DURATION}}')}}).encode();         r=u.Request('http://127.0.0.1:8000/v1/jobs',data=body,headers={'content-type':'application/json'});         print(u.urlopen(r).read().decode())"
+# Submit a job: `just submit smoke 1 0` -> 1 vehicle gateway. Same order as `just add`.
+submit NAME="smoke" VG="1" AG="0" DURATION="10":
+    @{{py}} -m tss.cli.submit {{NAME}} {{VG}} {{AG}} {{DURATION}}
+
+# A job that reports infra_error. A CHAOS CONTROL, not a customer verb: a customer
+# does not get to declare their own job's outcome, which is why this is separate.
+submit-bad NAME="flaky" VG="1" AG="0" DURATION="10":
+    @{{py}} -m tss.cli.submit {{NAME}} {{VG}} {{AG}} {{DURATION}} --outcome infra_error
 
 # THE MERGE GATE: 15 agents x 2-4 devices, 100 jobs at 30% multi-device, 5 seeds.
 # Zero invariant violations, or the build fails.

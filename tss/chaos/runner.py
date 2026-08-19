@@ -607,13 +607,31 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     failed = [r for r in reports if not r.ok]
+    seeds_run = ", ".join(str(r.seed) for r in reports)
     print()
-    print(f"{len(reports) - len(failed)}/{len(reports)} seed(s) clean")
+    print(
+        _verdict(
+            passed=not failed, seeds=seeds_run, clean=len(reports) - len(failed), total=len(reports)
+        )
+    )
     if failed:
         print("failing seeds: " + ", ".join(str(r.seed) for r in failed))
         print("replay one with: just chaos-seed <seed>")
         return 1
     return 0
+
+
+def _verdict(*, passed: bool, seeds: str, clean: int, total: int) -> str:
+    """The last thing on screen, and on a projector the only thing anyone reads.
+
+    A run that ends in a wall of counters and one quiet "5/5 seed(s) clean" makes
+    the audience look to the presenter to find out whether it worked. The word
+    and the seed, in a box.
+    """
+    rule = "=" * 78
+    word = "PASS" if passed else "FAIL"
+    summary = f"{clean}/{total} seed(s) clean  ·  seeds: {seeds}"
+    return f"{rule}\n  {word}  —  {summary}\n{rule}"
 
 
 if __name__ == "__main__":

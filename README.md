@@ -21,6 +21,11 @@ jobs run side by side on one machine as long as they need different devices.
   code existed and deliberately not rewritten since
 - **Licence:** [MIT](LICENSE)
 
+**See it survive failure:** [`TOUR.md`](TOUR.md) — kill a bench mid-job and watch the fleet recover,
+starve a multi-device job and watch the reservation hold a device that stays free and owned by
+nobody, quarantine a device and watch its bench keep working beside it. Every command in it is
+runnable as written.
+
 ---
 
 ## Install
@@ -168,82 +173,6 @@ just chaos-profile zombie      # one failure mode in isolation
 
 Every run prints its seed on the first line and again in any failure output, because a violation you
 cannot replay is a violation you cannot fix.
-
----
-
-## Watch it break
-
-The point of the design is what happens when a machine dies, so:
-
-```bash
-just watch                     # leave this running
-```
-
-In another terminal, kill a bench that is running something:
-
-```bash
-pkill -f "tss.agent.daemon --id bench-sf-01"    # or: just kill bench-sf-01
-```
-
-The bench flips to **OFFLINE** on both `tss watch` and the web page, and its jobs re-queue **within
-about 14 seconds** — `PRESENCE_TTL`
-(12s) plus `REAPER_INTERVAL` (2s). The view is pushed over a WebSocket, so the change appears the
-moment it happens rather than on the next poll. Nothing is lost: the jobs land on another bench and
-finish, and if the killed agent ever comes back its results are rejected as stale.
-
-### Watch a big job wait for a bench, without deadlocking it
-
-A job needing two devices can starve while single-device jobs take capacity the instant it frees. TSS
-handles that by **reserving** — withholding free devices on one bench until the big job can take them
-all at once. A reservation never marks a device busy and never gives it an owner, which is why it
-cannot deadlock (`TSS-Architecture.md` §3.4.1).
-
-Restart the service with a shorter starvation threshold — 60s is right in production and too long to
-stand in front of — and run two benches with *different hardware*, so it is unambiguous which jobs
-could go where:
-
-```bash
-TSS_STARVATION_THRESHOLD_S=5 just serve                                        # terminal 1
-just agent bench-sf-01 2                                                       # terminal 2
-.venv/bin/python -m tss.agent.daemon --id bench-ag-01 --devices 2 \
-    --product asset_gateway                                                    # terminal 3
-```
-
-Then, in a fourth:
-
-```bash
-just submit soak 1 0 90     # takes one of bench-sf-01's two vehicle gateways
-just submit gw2gw 2 0       # needs TWO vehicle gateways on one bench: nowhere to fit
-sleep 6
-just queue                  # -> gw2gw: RESERVING on bench-sf-01 (vg-02 held)
-just submit smoke 1 0 20    # another vehicle-gateway job — it does NOT take the reserved device
-just fleet                  # -> bench-sf-01 vg-02 still free, and still nobody's
-```
-
-```
-gw2gw (54cbe)  QUEUED  10s waited  — RESERVING on bench-sf-01 (vg-02)
-  needs: 2 devices, all on ONE bench
-           product=vehicle_gateway
-           product=vehicle_gateway
-  feasible benches (could ever satisfy this):
-    bench-sf-01
-      vg-01   BUSY soak (f347e) (11s / 600s budget)
-      vg-02   free  RESERVED FOR YOU
-  not feasible:
-    bench-ag-01  only 0 healthy matching device(s), needs 2
-  waiting on: vg-01 on bench-sf-01 to free (~589s of its budget left)
-  nothing else can take those devices while you wait
-```
-
-Meanwhile an asset-gateway job dispatches to `bench-ag-01` immediately — the reservation withholds
-devices on **one** bench, not the whole fleet:
-
-```bash
-curl -X POST http://127.0.0.1:8000/v1/jobs -H 'content-type: application/json' \
-  -d '{"name":"ag-check","requirements":[{"product":"asset_gateway"}],"payload":{"duration_s":20}}'
-```
-
-When `soak` finishes, `gw2gw` takes both devices in a single transaction — all of them or none.
 
 ---
 

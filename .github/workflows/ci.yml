@@ -39,8 +39,30 @@ jobs:
       - name: tests
         run: .venv/bin/python -m pytest -m "not slow"
 
+      # The deliberately-wrong implementations must still fail. `just test-naive`
+      # shows a human that they do, but every line of it is dash-prefixed, so it
+      # exits 0 either way and proved nothing to CI. This asserts it: if a foil
+      # ever passes, the tests written to catch that bug have lost their teeth
+      # and the build says so.
+      - name: foils (the tests still have teeth)
+        run: .venv/bin/python -m pytest tests/test_foils.py -m slow
+
       # 15 agents x 2-4 devices, 100 jobs at 30% multi-device, 5 seeds.
       # Fails the build on any invariant violation, any job that never finished,
       # and any profile that did not fire — see RunReport.check_floors.
       - name: chaos (merge gate)
         run: .venv/bin/python -m tss.chaos.runner --agents 15 --jobs 100 --multi-pct 30 --seeds 5 --seed 1
+
+      # A seed reproduces the workload and the fleet, NOT the interleaving — so a
+      # red run that cannot be reproduced on the first replay still has to be
+      # investigable. The runner dumps every event it recorded, named for the
+      # seed; keep it, because the database it came from lived in a temporary
+      # directory that is already gone.
+      - name: keep the evidence from a red run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-events
+          path: chaos-seed-*-events.jsonl
+          if-no-files-found: ignore
+          retention-days: 14

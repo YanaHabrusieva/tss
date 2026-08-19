@@ -14,8 +14,8 @@ import pytest
 
 from tss.chaos import invariants as chaos_invariants
 from tss.chaos.mock_agent import AgentTruth, RunningJob
-from tss.chaos.profiles import MIXED, fleet_profiles
-from tss.chaos.runner import CHAOS_CONFIG, ChaosRun
+from tss.chaos.profiles import ALL, CLEAN, MIXED, fleet_profiles
+from tss.chaos.runner import CHAOS_CONFIG, ChaosRun, RunReport, derive_deadline
 from tss.core.models import Outcome
 from tss.core.store import Store
 
@@ -375,3 +375,144 @@ def test_the_report_names_what_to_replay():
     assert "seed=1234" in rendered
     assert "just chaos-seed 1234" in rendered
     assert "I2:" in rendered
+
+
+# ------------------------------------------------------------------- floors
+def _evidence_report(**overrides) -> RunReport:
+    """A report in which every profile's mechanism visibly fired."""
+    report = RunReport(seed=1, agents=15, jobs_requested=100, jobs_submitted=100)
+    report.duration_s = 30.0
+    report.safety_checks = 110
+    report.outcomes = {"passed": 90, "dead_letter": 10}
+    report.fleet = {
+        "crashes": 5,
+        "dropped_beats": 30,
+        "reregistrations": 4,
+        "fenced_reports": 3,
+        "lost_responses": 6,
+    }
+    report.events = {
+        "offline": 20,
+        "requeued": 25,
+        "requeued_unreported": 7,
+        "inverse_fence_on_deaf": 2,
+        "timed_out": 8,
+        "resource.unhealthy": 3,
+    }
+    for key, value in overrides.items():
+        setattr(report, key, value)
+    return report
+
+
+@pytest.mark.parametrize("profile", [p for p, _ in MIXED], ids=lambda p: p.name)
+def test_no_profile_is_in_the_gate_without_a_floor(profile):
+    """THE RULE THE GATE IS BUILT ON: neuter any profile and the gate must go red.
+
+    Three profiles used to be in the mix with nothing asking them for evidence —
+    flapper's re-registrations were counted and never asserted, resource_flap's
+    unhealthy device was never required to appear, and nothing counted the
+    zombie's fenced reports at all, so the crasher's requeues satisfied every
+    floor the zombie could have failed. Each could have been silently disabled
+    and every seed would still have gone green.
+
+    Parametrized over MIXED, so this stays true of profiles added later: a new
+    profile with no floor fails here on the day it is added.
+    """
+    barren = RunReport(seed=1, agents=1, jobs_requested=1)
+
+    assert barren.check_floors([profile]), (
+        f"{profile.name} produced no floor at all — it can be neutered without the gate noticing"
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "bucket", "key", "phrase"),
+    [
+        ("flapper", "fleet", "reregistrations", "no bench re-registered"),
+        ("resource_flap", "events", "resource.unhealthy", "no device was reported unhealthy"),
+        ("zombie", "fleet", "fenced_reports", "no stale report was fenced"),
+        (
+            "deaf",
+            "events",
+            "inverse_fence_on_deaf",
+            "the inverse fence never fired on a bench that lost a reply",
+        ),
+    ],
+)
+def test_the_floor_for_each_profile_reads_that_profile_s_own_evidence(name, bucket, key, phrase):
+    """Not just "some floor fired" — the RIGHT floor, on a counter no other
+    profile can satisfy. A `deaf` floor that any requeue satisfies is one the
+    crasher passes on the deaf profile's behalf."""
+    profiles = [ALL[name]]
+
+    silent = _evidence_report()
+    getattr(silent, bucket)[key] = 0
+    assert any(phrase in f for f in silent.check_floors(profiles)), (
+        f"{name} fired nothing and the gate did not notice"
+    )
+
+    fired = _evidence_report()
+    assert not any(phrase in f for f in fired.check_floors(profiles))
+
+
+def test_the_watcher_floor_catches_a_checker_that_stopped_part_way():
+    """The most expensive silence in the harness: one exception used to kill the
+    watch task, and the run then finished green on the strength of checks it
+    never ran. Surviving is not the same as still working."""
+    died_early = _evidence_report(safety_checks=12)  # 30s at 0.25s should be ~120
+
+    died_early.floors = died_early.check_floors([CLEAN], watch_interval_s=0.25)
+
+    assert any("safety checks" in f for f in died_early.floors)
+    assert not died_early.ok, "a run nobody was checking must not report success"
+
+
+def test_the_watcher_floor_leaves_the_honest_path_alone():
+    """A real run lands near 0.9 of nominal because each check costs time. The
+    floor must have room for that, or it flakes on green runs."""
+    honest = _evidence_report(duration_s=30.0, safety_checks=108)
+
+    assert not any("safety checks" in f for f in honest.check_floors([CLEAN]))
+
+
+def test_a_swallowed_watcher_error_is_never_invisible():
+    report = _evidence_report(watch_errors=3)
+
+    assert "3 watcher error(s)" in report.render()
+
+
+def test_the_deadline_scales_with_the_workload():
+    """A fixed 90s made a big run go red for being big, which teaches people to
+    raise the number rather than read it."""
+    assert derive_deadline(100, 15) > 60
+    assert derive_deadline(500, 40) > derive_deadline(100, 15) * 2
+    assert ChaosRun(
+        seed=1, agents=15, jobs=100, multi_pct=0, profile_mix="clean", db_path=":memory:"
+    ).deadline_s == derive_deadline(100, 15)
+
+
+@pytest.mark.slow
+def test_the_deaf_bench_loses_a_reply_and_the_inverse_fence_recovers_it():
+    """The inverse fence, under randomized load rather than a hand-written
+    sequence. A deaf bench's /start lands and its REPLY is thrown away, so TSS
+    records a RUNNING job on a bench that does not know it owns it — and nothing
+    is wrong with that bench, so no lease will ever notice.
+
+    Asserted per JOB, not per bench: a healthy fleet produces `unreported_by_agent`
+    requeues of its own (see the note in the runner), and crediting the profile
+    with those would let it be neutered without the gate noticing.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = ChaosRun(
+            seed=11, agents=4, jobs=20, multi_pct=30, profile_mix="deaf", db_path=f"{tmp}/deaf.db"
+        )
+        report = run.execute()
+        deafened = {job for agent in run.fleet for job in agent.lost_start_jobs}
+        run.store.close()
+
+    assert report.fleet["lost_responses"] > 0, "the profile never discarded a reply"
+    assert deafened, "no job lost its /start reply"
+    assert report.events["inverse_fence_on_deaf"] > 0, (
+        "TSS was left holding jobs nobody was running and never took them back"
+    )
+    assert report.ok, "\n".join(report.floors + report.violations)

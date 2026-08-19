@@ -234,11 +234,30 @@ claim, a fan-out that requeues per device instead of per job, a scheduler that c
 after a pass instead of before, and a reservation that takes hardware instead of withholding it. They
 all fail, which is the evidence that the tests catch what they were written for.
 
-`just chaos` fails on three things, not one: any invariant violation, any job that never reached a
-terminal state, and **any profile that did not fire**. A run where nothing broke satisfies every
-safety invariant trivially, so the gate also asserts what the run produced — that the crasher
-crashed, that heartbeats were dropped, that jobs timed out and were requeued, and that at least one
-job passed.
+That recipe is for reading; `tests/test_foils.py` is the assertion. Every line of `just test-naive`
+is dash-prefixed, so it exits 0 whether the foils fail or pass — it could not tell you the tests had
+lost their teeth. The meta-test runs each foil in a subprocess with a clean environment and requires
+a non-zero exit, so a foil that starts passing fails the build. It runs in CI.
+
+`just chaos` fails on four things, not one: any invariant violation, any job that never reached a
+terminal state, **any profile that did not fire**, and **any run whose safety checks stopped
+happening**. A run where nothing broke satisfies every safety invariant trivially, so the gate also
+asserts what the run produced — that the crasher crashed, that heartbeats were dropped, that jobs
+timed out and were requeued, that a bench re-registered, that a device sickened while its machine
+stayed healthy, that a stale report was fenced, that a lost reply was recovered by the inverse
+fence, and that at least one job passed. Every profile in the mix has a floor, and a test asserts
+that: a profile nobody checks cannot be added.
+
+The watcher that runs those checks has its own floor. It used to be one unguarded loop — a single
+exception ended it, the teardown swallowed the error, and the run finished green having checked
+nothing since. Now the body is guarded, the errors are counted and printed, and a finished run must
+show safety checks consistent with how long it ran.
+
+A failing run writes `chaos-seed-<n>-events.jsonl`: every event it recorded, kept because the
+database it came from lived in a temporary directory that is already gone. CI uploads it. The seed
+fixes the workload and the fleet — which bench gets which profile, every job spec, every crash and
+dropped beat — but **not** the interleaving, which rides on real asyncio scheduling, real sockets and
+a real SQLite. A replay re-runs the scenario, not the schedule.
 
 CI runs lint, the suite, and the chaos gate on every push
 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).

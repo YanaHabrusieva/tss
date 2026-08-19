@@ -11,3 +11,5 @@ __pycache__/
 .demo-logs/
 # The README's run-it instructions create this in the working directory.
 bench.json
+# The event log a failing chaos run dumps for evidence.
+chaos-seed-*-events.jsonl

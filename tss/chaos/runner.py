@@ -12,6 +12,14 @@ zero violations across every seed CI runs" is a threshold you can defend.
 EVERY RUN LOGS ITS SEED, first line and again in any failure output. A violation
 you cannot replay is a violation you cannot fix.
 
+WHAT A SEED ACTUALLY REPRODUCES: the workload and the fleet — which benches get
+which profile, what inventory each has, every job spec, every crash and dropped
+beat drawn from a profile's probabilities. It does NOT reproduce the schedule.
+The interleavings ride on real asyncio scheduling, real sockets and a real
+SQLite, so a replay re-runs the same SCENARIO, not the same execution. That is
+enough to make a violation investigable and not enough to guarantee it recurs on
+the first try — which is why a failing run also dumps its event log.
+
 NO SILENT CAPS. If the run drops jobs, truncates, or hits its deadline with work
 outstanding, the summary says so loudly. A run that quietly covered less than it
 claims reads as "all green" when it is not.
@@ -22,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import logging
 import random
 import sys
@@ -37,7 +46,7 @@ from tss.chaos import invariants as chaos_invariants
 from tss.chaos.mock_agent import MockAgent
 from tss.chaos.profiles import fleet_profiles
 from tss.core.config import Config
-from tss.core.store import Store
+from tss.core.store import DETAIL_UNREPORTED, Store
 
 log = logging.getLogger("tss.chaos")
 
@@ -54,6 +63,14 @@ CHAOS_CONFIG = Config(
     unsatisfiable_timeout_s=25.0,
     default_max_duration_s=3,
 )
+
+#: How often the watcher runs the safety checks.
+WATCH_INTERVAL_S = 0.25
+#: The floor on how many of those a finished run must have completed, as a
+#: fraction of duration/interval. Deliberately loose — each check costs real time
+#: and the loop cannot hit its interval exactly, so the honest path lands near
+#: 0.9 and has ~2x headroom. A watcher that died half way cannot reach it.
+WATCH_FLOOR_FRACTION = 0.5
 
 PRODUCTS = (
     {"product": "vehicle_gateway", "harness": "j1939"},
@@ -72,7 +89,11 @@ class RunReport:
     profile_counts: dict[str, int] = field(default_factory=dict)
     outcomes: dict[str, int] = field(default_factory=dict)
     violations: list[str] = field(default_factory=list)
+    #: Checks that ran to COMPLETION. A check that raised is not a check.
     safety_checks: int = 0
+    #: Exceptions the watcher swallowed to stay alive. Never invisible: a
+    #: checker that is throwing is a checker whose green means nothing.
+    watch_errors: int = 0
     #: Evidence the chaos actually happened. A "clean" run in which nothing ever
     #: crashed, expired or timed out proves nothing at all.
     events: dict[str, int] = field(default_factory=dict)
@@ -81,6 +102,8 @@ class RunReport:
     deadline_hit: bool = False
     duration_s: float = 0.0
     notes: list[str] = field(default_factory=list)
+    #: Where a failing run wrote its event log. Empty on a clean run.
+    evidence_path: str = ""
 
     #: What the run must have PRODUCED, not merely survived. Filled in from the
     #: profiles actually in the fleet.
@@ -90,7 +113,7 @@ class RunReport:
     def ok(self) -> bool:
         return not self.violations and not self.unfinished and not self.floors
 
-    def check_floors(self, profiles: Sequence) -> list[str]:
+    def check_floors(self, profiles: Sequence, *, watch_interval_s: float = 0.25) -> list[str]:
         """Did the chaos actually happen?
 
         Nothing above this line would notice if it had not. Neuter
@@ -110,6 +133,23 @@ class RunReport:
         def require(condition: bool, what: str, why: str) -> None:
             if not condition:
                 failures.append(f"FLOOR: {what} — {why}")
+
+        # THE WATCHER ITSELF. Every floor below asks whether the fleet did
+        # something; this one asks whether anybody was looking. One exception out
+        # of check_safety used to kill the task, and the run then finished green
+        # having checked nothing since — the most expensive kind of quiet.
+        # WATCH_FLOOR_FRACTION of nominal, because a check costs time and the
+        # loop cannot hit its interval exactly; a watcher that died in the first
+        # half of the run cannot reach it.
+        if self.duration_s > 0:
+            nominal = self.duration_s / watch_interval_s
+            require(
+                self.safety_checks >= nominal * WATCH_FLOOR_FRACTION,
+                f"only {self.safety_checks} safety checks in {self.duration_s:.0f}s "
+                f"(expected at least {nominal * WATCH_FLOOR_FRACTION:.0f})",
+                "the watcher stopped checking part-way through and the run finished "
+                "green on the strength of the checks it never ran",
+            )
 
         if any(p.can_pass_a_job for p in profiles):
             require(
@@ -147,6 +187,33 @@ class RunReport:
                 "no job was requeued",
                 "benches died holding jobs and nothing came back",
             )
+        if "flapper" in present:
+            require(
+                self.fleet.get("reregistrations", 0) > 0,
+                "no bench re-registered",
+                "flapper is in the fleet; registration idempotency was never exercised",
+            )
+        if "resource_flap" in present:
+            require(
+                self.events.get("resource.unhealthy", 0) > 0,
+                "no device was reported unhealthy",
+                "resource_flap is in the fleet; device health never diverged from "
+                "machine health, which is the whole distinction it tests",
+            )
+        if "zombie" in present:
+            require(
+                self.fleet.get("fenced_reports", 0) > 0,
+                "no stale report was fenced",
+                "zombie is in the fleet; if none of its reports was ever rejected it "
+                "never outlived its lease, and the epoch fence was never exercised",
+            )
+        if "deaf" in present:
+            require(
+                self.events.get("inverse_fence_on_deaf", 0) > 0,
+                "the inverse fence never fired on a bench that lost a reply",
+                "deaf is in the fleet; a bench discarded a reply and TSS never took back "
+                "the job it was left holding but not running",
+            )
         return failures
 
     def render(self) -> str:
@@ -155,7 +222,8 @@ class RunReport:
             f"/{self.jobs_requested}  multi={self.multi_pct}%  {self.duration_s:.1f}s",
             f"  profiles: {_counts(self.profile_counts)}",
             f"  outcomes: {_counts(self.outcomes)}",
-            f"  safety checks run: {self.safety_checks}",
+            f"  safety checks run: {self.safety_checks}"
+            + (f"   !! {self.watch_errors} watcher error(s)" if self.watch_errors else ""),
             f"  chaos:    {_counts(self.fleet)}",
             f"  events:   {_counts(self.events)}",
         ]
@@ -174,6 +242,12 @@ class RunReport:
             lines.append("  OK — no invariant violated")
         else:
             lines.append(f"  FAILED — replay with: just chaos-seed {self.seed}")
+            if self.evidence_path:
+                lines.append(f"       evidence: {self.evidence_path} (every event this run wrote)")
+            lines.append(
+                "       the seed fixes the workload and the fleet, not the interleaving — "
+                "a replay re-runs the scenario, not the schedule"
+            )
         return "\n".join(lines)
 
 
@@ -196,6 +270,18 @@ def _first_of_each(violations: list[str], per_kind: int = 3) -> list[str]:
     return out
 
 
+def derive_deadline(jobs: int, agents: int) -> float:
+    """How long a run of this size is allowed to take before it is called stuck.
+
+    A fixed 90s was right for the gate's own shape and wrong for everything else:
+    `--jobs 500` on a loaded CI box hit it and went red for being big, which
+    teaches people to raise the number rather than read it. Scaled, the headroom
+    is roughly 3x the honest path at every size — the gate's own 100/15 lands
+    near 28s against a 95s deadline.
+    """
+    return 30.0 + 0.5 * jobs + 1.0 * agents
+
+
 class ChaosRun:
     def __init__(
         self,
@@ -207,7 +293,7 @@ class ChaosRun:
         profile_mix: str,
         db_path: str,
         config: Config = CHAOS_CONFIG,
-        deadline_s: float = 90.0,
+        deadline_s: float | None = None,
         products: tuple[dict, ...] = PRODUCTS,
     ) -> None:
         self.seed = seed
@@ -217,7 +303,7 @@ class ChaosRun:
         self.multi_pct = multi_pct
         self.profile_mix = profile_mix
         self.config = config
-        self.deadline_s = deadline_s
+        self.deadline_s = derive_deadline(jobs, agents) if deadline_s is None else deadline_s
         self.products = products
         self.store = Store(db_path, config)
         self.app = create_app(config, self.store)
@@ -244,6 +330,7 @@ class ChaosRun:
                     profile=profile,
                     seed=self.seed,
                     presence_ttl_s=self.config.presence_ttl_s,
+                    reaper_interval_s=self.config.reaper_interval_s,
                 )
             )
             self.report.profile_counts[profile.name] = (
@@ -290,20 +377,41 @@ class ChaosRun:
         self.report.jobs_submitted = len(self.submitted)
 
     async def _watch(self, stop: asyncio.Event) -> None:
-        """The safety checks, continuously, while everything is in flight."""
+        """The safety checks, continuously, while everything is in flight.
+
+        THE BODY IS GUARDED, and that is not defensive habit. Unguarded, one
+        exception out of `check_safety` or `ground_truth` — a transient
+        SQLITE_BUSY on the checker's own connection is enough — ended the task,
+        the teardown swallowed it as just another cancelled task, and the run
+        reported green having checked nothing from that moment on. The floor in
+        `check_floors` is the other half: surviving is not the same as still
+        working, so the count has to be defended too.
+        """
         checker_store = Store(self.store.path, self.config)
         try:
             while not stop.is_set():
-                truth = [agent.ground_truth() for agent in self.fleet]
-                violations = chaos_invariants.check_safety(
-                    checker_store, truth, self.app.state.scheduler
-                )
+                try:
+                    truth = [agent.ground_truth() for agent in self.fleet]
+                    violations = chaos_invariants.check_safety(
+                        checker_store, truth, self.app.state.scheduler
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Counted, logged with the seed, and the loop lives. NOT
+                    # counted as a safety check: a check that raised is not a
+                    # check, and letting it inflate the count would defeat the
+                    # floor that exists to catch exactly this.
+                    self.report.watch_errors += 1
+                    log.exception("seed=%s  safety check raised; continuing", self.seed)
+                    await asyncio.sleep(WATCH_INTERVAL_S)
+                    continue
                 self.report.safety_checks += 1
                 for violation in violations:
                     if violation not in self.report.violations:
                         log.error("seed=%s  %s", self.seed, violation)
                         self.report.violations.append(violation)
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(WATCH_INTERVAL_S)
         finally:
             checker_store.close()
 
@@ -342,6 +450,8 @@ class ChaosRun:
                 for task in [*agents, watcher, submitter]:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await task
+                for agent in self.fleet:
+                    await agent.aclose()
 
     def execute(self) -> RunReport:
         began = time.monotonic()
@@ -395,19 +505,65 @@ class ChaosRun:
                 GROUP BY kind"""
         ):
             self.report.events[row["kind"].replace("job.", "").replace("agent.", "")] = row["n"]
+        # The inverse fence leaves its own kind of requeue, told apart by the
+        # reason: a presence reap says presence_expired, this one says the bench
+        # never mentioned the job.
+        #
+        # AND THEN ATTRIBUTED TO THE EXACT JOBS WHOSE REPLY WAS LOST. The reason
+        # alone is not enough, and finding that out is what this floor was for:
+        # a fleet of four perfectly healthy benches produces these too, because
+        # `pending_assignment` hands over one job per beat while the tracker
+        # counts misses against every job the bench owns — so a bench handed two
+        # jobs in one scheduler pass has the second taken back before TSS ever
+        # told it. Real, separate, and reported. Here it means the untargeted
+        # count is noise the `deaf` profile could hide inside — so the floor reads
+        # only the recovery of a job whose /start reply a bench actually threw
+        # away, which no unrelated requeue can supply.
+        unreported = self.store.conn.execute(
+            "SELECT job_id, COUNT(*) AS n FROM events "
+            "WHERE kind = 'job.requeued' AND json_extract(detail, '$.reason') = ? "
+            "GROUP BY job_id",
+            (DETAIL_UNREPORTED,),
+        ).fetchall()
+        deafened = {job for a in self.fleet for job in a.lost_start_jobs}
+        self.report.events["requeued_unreported"] = sum(r["n"] for r in unreported)
+        self.report.events["inverse_fence_on_deaf"] = sum(
+            r["n"] for r in unreported if r["job_id"] in deafened
+        )
         self.report.fleet = {
             "crashes": sum(a.crashes for a in self.fleet),
             "dropped_beats": sum(a.dropped_beats for a in self.fleet),
             "reregistrations": sum(a.reregistrations for a in self.fleet),
+            "fenced_reports": sum(a.fenced_reports for a in self.fleet),
+            "lost_responses": sum(a.lost_responses for a in self.fleet),
         }
+        # Set BEFORE the floors run: the watcher floor is measured against it.
+        self.report.duration_s = time.monotonic() - began
         self.report.floors = self.report.check_floors(
-            fleet_profiles(self.n_agents, self.profile_mix)
+            fleet_profiles(self.n_agents, self.profile_mix), watch_interval_s=WATCH_INTERVAL_S
         )
         for floor in self.report.floors:
             log.error("seed=%s  %s", self.seed, floor)
-        self.report.duration_s = time.monotonic() - began
+        # ITEM 4: a red run carries its own evidence. The database lives in a
+        # temporary directory and is gone the moment the run returns, so the one
+        # artifact worth keeping is written out while it still exists.
+        if not self.report.ok:
+            self.report.evidence_path = self._dump_events()
         self.store.close()
         return self.report
+
+    def _dump_events(self) -> str:
+        """Every event this run recorded, as JSONL, named for the seed."""
+        path = f"chaos-seed-{self.seed}-events.jsonl"
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"seed": self.seed, "report": self.report.render()}) + "\n")
+                for event in self.store.events():
+                    handle.write(event.model_dump_json() + "\n")
+        except OSError as exc:  # pragma: no cover — a full disk on a red run
+            log.error("seed=%s  could not write the event dump: %r", self.seed, exc)
+            return ""
+        return path
 
 
 def run_seeds(seeds: list[int], **kwargs) -> list[RunReport]:
@@ -430,7 +586,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", default="mixed", help="'mixed' or one profile name")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--seeds", type=int, help="run this many seeds, starting at --seed")
-    parser.add_argument("--deadline", type=float, default=90.0)
+    parser.add_argument(
+        "--deadline", type=float, default=None, help="default: derived from --jobs and --agents"
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 

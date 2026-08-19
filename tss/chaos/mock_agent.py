@@ -10,6 +10,11 @@ bug the chaos suite has any chance of finding lives in the interaction between
 the real daemon and the real service, and a hand-written stand-in would quietly
 paper over exactly the mismatches worth finding.
 
+WHAT IT COUNTS IS EVIDENCE. `fenced_reports` and `lost_responses` are not
+statistics — they are what the gate's floors read to prove the zombie was
+actually fenced and the deaf bench actually lost a reply. A profile whose effect
+nothing counts is a profile that can be neutered without the gate noticing.
+
 GROUND TRUTH is the other half of the job. The invariant checker cannot learn
 some things from TSS's database — TSS's record of a device's capabilities is
 precisely what this agent claimed, so a liar's fleet looks perfectly healthy from
@@ -69,6 +74,7 @@ class MockAgent(TestbedAgent):
         profile: Profile,
         seed: int,
         presence_ttl_s: float = 12.0,
+        reaper_interval_s: float = 2.0,
     ) -> None:
         declared = inventory
         self.true_capabilities = {d["id"]: dict(d["capabilities"]) for d in inventory}
@@ -86,10 +92,29 @@ class MockAgent(TestbedAgent):
         self.profile = profile
         self.rng = random.Random(f"{seed}:{agent_id}")
         self.presence_ttl_s = presence_ttl_s
+        self.reaper_interval_s = reaper_interval_s
         self.alive = True
         self.crashes = 0
         self.dropped_beats = 0
         self.reregistrations = 0
+        #: /complete answered 409 — the epoch fence rejecting a stale result.
+        #: The zombie profile exists to produce these, and until something
+        #: counted them the gate could not tell a fenced zombie from a zombie
+        #: that never went silent.
+        self.fenced_reports = 0
+        #: replies discarded after the server had already acted on the request.
+        self.lost_responses = 0
+        #: the job ids whose /start reply this bench threw away. Named, not just
+        #: counted: it is what lets the gate require that the inverse fence took
+        #: back THESE jobs, rather than crediting the profile with any unrelated
+        #: requeue that happened to land on a deaf bench.
+        self.lost_start_jobs: set[str] = set()
+        # The daemon uses an injected client as-is and does not close it, which
+        # is what lets the response hook live for the whole run — including
+        # across a crash and reboot.
+        self._client = httpx.AsyncClient(
+            timeout=30.0, event_hooks={"response": [self._on_response]}
+        )
         self._devices: dict[str, tuple[str, ...]] = {}
         self._silent_until = 0.0
         self._vanish_at: float | None = None
@@ -97,6 +122,50 @@ class MockAgent(TestbedAgent):
         self._next_device_flap: float | None = None
         self._sick_device: str | None = None
         self._local_stop = asyncio.Event()
+
+    async def aclose(self) -> None:
+        """The daemon never closes an injected client, so this bench owns it."""
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await self._client.aclose()
+
+    # ------------------------------------------------------------- the wire
+    async def _on_response(self, response: httpx.Response) -> None:
+        """Every reply this bench receives, before the daemon sees it.
+
+        Two jobs. It counts the epoch fence rejecting a stale result, which is
+        the zombie profile's whole output and is invisible from TSS's side — the
+        409 is the only trace, and TSS does not record one. And it is where the
+        `deaf` profile loses a REPLY: the request has already landed and the
+        server has already acted on it, so this is the lost-response case the
+        inverse fence was built for, not the lost-request case the presence TTL
+        already absorbs.
+        """
+        path = response.request.url.path
+        if response.status_code == 409 and path.endswith("/complete"):
+            self.fenced_reports += 1
+        if not self.profile.deaf_probability:
+            return
+        # /start ONLY, and that is the whole point rather than a simplification.
+        # Losing the reply to /complete proves nothing: TSS has already committed
+        # the result and the job is terminal, so there is nothing left for anyone
+        # to take back — the bench merely forgets a job that is already finished.
+        # Losing the reply to /start is the one that leaves TSS holding a RUNNING
+        # job on a bench that does not know it owns it, which is the disagreement
+        # no lease can detect and the only thing the inverse fence can fix.
+        # Never heartbeats either: losing those is flaky_network's job, and here
+        # it would just look like death.
+        if not path.endswith("/start"):
+            return
+        if self.rng.random() >= self.profile.deaf_probability:
+            return
+        # Drain the body first so the connection is returned to the pool rather
+        # than abandoned mid-response.
+        with contextlib.suppress(Exception):
+            await response.aread()
+        self.lost_responses += 1
+        self.lost_start_jobs.add(path.rsplit("/", 2)[-2])
+        log.info("%s discarded the reply to %s", self.agent_id, path)
+        raise httpx.ReadError("reply discarded (deaf profile)", request=response.request)
 
     # ------------------------------------------------------------ ground truth
     def ground_truth(self) -> AgentTruth:
@@ -137,10 +206,20 @@ class MockAgent(TestbedAgent):
             if self.profile.silent_ttls:
                 # The zombie: go quiet long enough to be reaped, keep working,
                 # then report a result for a run TSS has already given away.
-                self._silent_until = time.monotonic() + self.profile.silent_ttls * (
-                    self.presence_ttl_s
-                )
-                await asyncio.sleep(self.profile.silent_ttls * self.presence_ttl_s + 0.2)
+                #
+                # Two derived margins, both of which used to be one hardcoded
+                # 0.2. Expiry is noticed by the next SWEEP, not at the instant
+                # the lease lapses, so the report has to land at least a reaper
+                # interval late or there is no reap yet for the fence to reject
+                # against. And the silence has to outlast the report itself: the
+                # moment this bench heartbeats again it gets 410 presence_expired
+                # and the daemon CANCELS the run — correctly, and the result is
+                # then never sent, which is the one thing this profile exists to
+                # send. So it stays partitioned one beat past its own report.
+                silence = self.profile.silent_ttls * self.presence_ttl_s
+                silence += 2 * self.reaper_interval_s
+                self._silent_until = time.monotonic() + silence + self.heartbeat_interval_s
+                await asyncio.sleep(silence)
                 return ExecutionResult("passed", "zombie report", 0.0)
 
             low, high = self.profile.duration_multiplier

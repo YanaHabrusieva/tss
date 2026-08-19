@@ -15,7 +15,20 @@ points at a decision rather than at "the fleet".
 | idle_death     | vanishes without ever taking a job | idle agents are reaped    |
 | resource_flap  | one device sickens, machine fine   | device vs agent health    |
 | flapper        | re-registers every few seconds     | registration is idempotent|
+| deaf           | /start lands; its REPLY is dropped | the INVERSE FENCE (§3.5)  |
 | liar           | declares capabilities it lacks     | graceful failure + I4     |
+
+`deaf` is the one that exercises the inverse fence under load. `flaky_network`
+drops REQUESTS, which TSS never sees and the presence TTL absorbs; `deaf` lets the
+request land and discards the REPLY, so TSS commits a /start the bench never
+learns about. The bench then holds no job and mentions none, while TSS believes it
+is running one — the disagreement no lease can detect, because the bench is
+perfectly healthy. Only the inverse fence closes it.
+
+It targets /start and nothing else. Losing the reply to /complete proves nothing:
+the result is already committed and the job already terminal, so there is nothing
+for anyone to take back. Before this profile existed the inverse fence was covered
+by two hand-scripted sequences and never met randomized load at all.
 
 `liar` is deliberately NOT in the gate mix. It produces I4 violations by
 construction — that is the profile working, not TSS failing — and putting it in
@@ -51,6 +64,9 @@ class Profile:
     flap_every_ttls: float = 0.0
     #: report one device unhealthy, then healthy again, on this cycle
     flap_device_every_ttls: float = 0.0
+    #: p(the reply to /start is discarded after the server has already recorded
+    #: it) — a lost RESPONSE, not a lost request
+    deaf_probability: float = 0.0
     #: declare capabilities the hardware does not have
     lies_about_capabilities: bool = False
     #: fail every job it is given (a liar's tests cannot pass)
@@ -104,6 +120,11 @@ RESOURCE_FLAP = Profile(
 FLAPPER = Profile(
     "flapper", "registration is idempotent; no duplicates, no orphans", flap_every_ttls=4.0
 )
+DEAF = Profile(
+    "deaf",
+    "the inverse fence takes back a job the bench never learned it owned",
+    deaf_probability=0.5,
+)
 LIAR = Profile(
     "liar",
     "graceful failure, then quarantine — and I4 against ground truth",
@@ -123,6 +144,7 @@ ALL: dict[str, Profile] = {
         IDLE_DEATH,
         RESOURCE_FLAP,
         FLAPPER,
+        DEAF,
         LIAR,
     )
 }
@@ -140,6 +162,7 @@ MIXED: tuple[tuple[Profile, int], ...] = (
     (IDLE_DEATH, 1),
     (RESOURCE_FLAP, 1),
     (FLAPPER, 1),
+    (DEAF, 2),
 )
 
 
